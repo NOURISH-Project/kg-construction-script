@@ -1,1115 +1,1 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Food triples (fixed relations) + optional Cypher generation via LLM.
-
-Features:
-- Pull items from Neo4j (or a text file).
-- Infer stage/ethnic/import/cert using LLM if available; fall back to heuristics.
-- Validate candidate triples with heuristics + optional LLM validator prompt.
-- Emit CSV of strict fixed relations.
-- (Optional) Emit per-item Cypher files using a regulated, ontology-anchored prompt.
-
-Env vars (can be overridden via CLI):
-  NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
-  OPENAI_API_KEY, OPENAI_MODEL, OPENAI_VALIDATOR_MODEL
-  OUTPUT_CSV, ITEM_LIMIT
-  REGION, EMIT_CYPHER, CYPHER_DIR
-  VALIDATE_WITH_LLM  (true/false)
-"""
-
-import os, json, csv, re, time, logging, argparse
-import sys
-from typing import List, Dict, Any, Tuple
-from dataclasses import dataclass, field
-from collections import Counter
-from functools import wraps, lru_cache
-from pathlib import Path
-
-from dotenv import load_dotenv
-from neo4j import GraphDatabase
-from neo4j.exceptions import CypherSyntaxError
-import unicodedata
-
-# ------------- load .env -------------
-load_dotenv()
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-OPENAI_VALIDATOR_MODEL = os.getenv("OPENAI_VALIDATOR_MODEL", OPENAI_MODEL)
-
-OUTPUT_CSV = os.getenv("OUTPUT_CSV", "food_relationships.csv")
-ITEM_LIMIT = int(os.getenv("ITEM_LIMIT", "200"))
-
-REGION = os.getenv("REGION", "US")
-EMIT_CYPHER = os.getenv("EMIT_CYPHER", "false").lower() in ("1","true","yes")
-CYPHER_DIR = os.getenv("CYPHER_DIR", "cypher_out")
-VALIDATE_WITH_LLM = os.getenv("VALIDATE_WITH_LLM", "false").lower() in ("1","true","yes")
-
-# ------------- logging -------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("food-triples")
-
-# ------------- fixed relations (single source of truth) -------------
-FIXED_RELS = {
-    # Production / Cultivation
-    "produced_by", "cultivated_by", "harvested_by", "raised_by", "caught_by",
-    "processed_by", "graded_by", "pressed_by", "aged_by", "roasted_by", "ground_by",
-    "baked_by", "confected_by", "brewed_by", "fermented_by", "slaughtered_by",
-    "butchered_by", "filleted_by", "smoked_by", "dried_by",
-
-    # Packaging / Certification
-    "packaged_by", "labeled_by", "certified_by", "inspected_by",
-
-    # Distribution / Transport / Sales
-    "purchased_by", "sold_by", "transported_by", "imported_by", "exported_by",
-    "warehoused_by", "distributed_by",
-
-    # Preparation / Serving (Prepared Foods)
-    "prepared_by", "served_by", "cooked_by", "assembled_by", "delivered_by",
-
-    # Non-binary tag relations retained as-is
-    "is_EthnicElement_Of", "is_imported_From",
-}
-
-# ------------- stage templates (use only FIXED_RELS) -------------
-TEMPLATE_BY_STAGE = {
-    # Unprocessed agricultural inputs
-    "raw_commodity": [
-        ("produced_by",    "Farm"),
-        ("harvested_by",   "Farm"),
-        ("raised_by",      "Ranch"),
-        ("caught_by",      "Fishery"),
-        ("cultivated_by",  "Orchard"),
-        ("cultivated_by",  "Vineyard"),
-        ("produced_by",    "Dairy Farm"),
-        ("produced_by",    "Poultry Farm"),
-        ("produced_by",    "Apiary"),
-        ("cultivated_by",  "Greenhouse"),
-        ("cultivated_by",  "Urban Farm"),
-        ("cultivated_by",  "Hydroponic Farm"),
-        # first handling
-        ("processed_by",   "Mill"),
-        ("processed_by",   "Grain Elevator"),
-        ("graded_by",      "Inspector"),
-        ("packaged_by",    "Packhouse"),
-        # retail (fresh)
-        ("sold_by",        "Fresh Produce Market"),
-        ("sold_by",        "Farmers' Market"),
-        ("sold_by",        "Produce Stand"),
-        ("sold_by",        "CSA / Produce Box"),
-        ("sold_by",        "Fishmonger / Seafood Market"),
-        ("sold_by",        "Butcher"),
-        # logistics
-        ("transported_by", "Carrier"),
-        ("transported_by", "Cold Chain Carrier"),
-    ],
-
-    # Manufactured / packaged foods, ingredients, and specialty goods
-    "processed_product": [
-        # primary processing & manufacturing
-        ("produced_by",    "Mill"),
-        ("processed_by",   "Cannery"),
-        ("processed_by",   "Creamery / Dairy Processor"),
-        ("processed_by",   "Meat Processor / Abattoir"),
-        ("processed_by",   "Butcher / Charcuterie"),
-        ("processed_by",   "Seafood Processor"),
-        ("processed_by",   "Picklery / Fermenter"),
-        ("processed_by",   "Tortilleria"),
-        ("processed_by",   "Noodle Factory"),
-        ("processed_by",   "Tofu Factory / Soy Processor"),
-        ("roasted_by",     "Coffee Roastery"),
-        ("ground_by",      "Spice Grinder / Masala Mill"),
-        ("baked_by",       "Bakery"),
-        ("confected_by",   "Confectioner / Chocolatier"),
-        ("brewed_by",      "Brewery"),
-        ("fermented_by",   "Winery / Cidery / Distillery"),
-        ("pressed_by",     "Oil Press"),
-        ("aged_by",        "Cheesemaker"),
-        # packaging & compliance
-        ("packaged_by",    "Packager"),
-        # distribution
-        ("purchased_by",   "Importer"),
-        ("purchased_by",   "Distributor"),
-        ("transported_by", "Distributor"),
-        ("transported_by", "Cold Chain Carrier"),
-        ("sold_by",        "Wholesaler"),
-        # retail: general + specialty + diet-specific
-        ("sold_by",        "Supermarket"),
-        ("sold_by",        "Convenience Store"),
-        ("sold_by",        "Co-op / Health Food Store"),
-        ("sold_by",        "Ethnic Grocery"),
-        ("sold_by",        "Asian Grocery"),
-        ("sold_by",        "Indian Store"),
-        ("sold_by",        "Mexican Market"),
-        ("sold_by",        "Middle Eastern Market"),
-        ("sold_by",        "European Deli"),
-        ("sold_by",        "Vegan Market"),
-        ("sold_by",        "Gluten-Free Specialty"),
-        ("sold_by",        "Online Marketplace"),
-        # food-service purchasing
-        ("purchased_by",   "Restaurant"),
-        ("purchased_by",   "Caterer"),
-        ("purchased_by",   "Ghost Kitchen / Cloud Kitchen"),
-        ("purchased_by",   "Food Truck"),
-    ],
-
-    # Ready-to-eat / prepared foods
-    "prepared_dish": [
-        ("prepared_by",    "Restaurant"),
-        ("served_by",      "Restaurant"),
-        ("prepared_by",    "Bulk Producer"),
-        ("prepared_by",    "Caterer"),
-        ("prepared_by",    "Ghost Kitchen / Cloud Kitchen"),
-        ("prepared_by",    "Food Truck"),
-        ("prepared_by",    "Deli / Prepared Foods Counter"),
-        ("prepared_by",    "Bakery-Café"),
-        ("prepared_by",    "Pizzeria"),
-        ("prepared_by",    "Taqueria"),
-        ("prepared_by",    "BBQ Joint"),
-        ("prepared_by",    "Butcher (Ready-to-Cook / Marinated)"),
-        ("prepared_by",    "Fishmonger (Ready-to-Cook / Marinated)"),
-        # dietary-focused venues
-        ("prepared_by",    "Vegan Restaurant"),
-        ("prepared_by",    "Vegetarian Restaurant"),
-        ("prepared_by",    "Indian Vegan Restaurant"),
-        ("prepared_by",    "Gluten-Free Kitchen"),
-        # institutional / large-volume
-        ("prepared_by",    "Commissary / Central Kitchen"),
-        ("served_by",      "Cafeteria / Institutional Foodservice"),
-        # retail prepared sections
-        ("served_by",      "Supermarket Hot Bar"),
-        ("served_by",      "Supermarket Deli"),
-        # logistics (for meal kits / bulk prepared)
-        ("transported_by", "Carrier"),
-        ("transported_by", "Cold Chain Carrier"),
-    ],
-}
-
-# Validate template relations
-for _stage, _pairs in TEMPLATE_BY_STAGE.items():
-    for _rel, _ in _pairs:
-        assert _rel in FIXED_RELS, f"Template uses non-allowed relation '{_rel}' in stage '{_stage}'"
-
-# ------------- utilities -------------
-def retry(max_tries=3, base_delay=0.6):
-    def deco(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            tries = 0
-            while True:
-                try:
-                    return fn(*args, **kwargs)
-                except Exception as e:
-                    tries += 1
-                    logger.warning("Retry %s/%s in %s: %s", tries, max_tries, fn.__name__, e)
-                    if tries >= max_tries:
-                        raise
-                    time.sleep(base_delay * (2 ** (tries - 1)))
-        return wrapper
-    return deco
-
-def _strip_code_fences(s: str) -> str:
-    if not s:
-        return s
-    s = s.strip()
-    if s.startswith("```"):
-        s = re.sub(r"^```(?:json|cypher)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.DOTALL)
-    return s.strip()
-
-def json_relaxed_load(s: str):
-    s = _strip_code_fences(s)
-    try:
-        return json.loads(s)
-    except Exception:
-        m = re.search(r"(\{.*\}|\[.*\])", s, flags=re.DOTALL)
-        if m:
-            return json.loads(m.group(1))
-        raise
-
-def batched(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
-
-# ------------- OpenAI client -------------
-def get_openai_client():
-    if not OPENAI_API_KEY:
-        return None
-    try:
-        from openai import OpenAI
-        return OpenAI(api_key=OPENAI_API_KEY)
-    except Exception as e:
-        logger.info("OpenAI client unavailable: %s", e)
-        return None
-
-def llm_available() -> bool:
-    return get_openai_client() is not None
-
-# ------------- state -------------
-@dataclass
-class State:
-    items: List[str] = field(default_factory=list)
-    item_stage: Dict[str, str] = field(default_factory=dict)
-    ethnic_market: Dict[str, str] = field(default_factory=dict)   # item -> "Indian Grocery" / ...
-    import_origin: Dict[str, str] = field(default_factory=dict)   # item -> "India" / "Domestic (USA)" / region
-    us_cert_authority: Dict[str, str] = field(default_factory=dict)  # item -> "USDA Organic" / "FDA" / ...
-    triples: List[List[str]] = field(default_factory=list)
-    diagnostics: Dict[str, Any] = field(default_factory=dict)
-
-# ------------- Neo4j -------------
-def fetch_items_via_cypher(limit: int) -> List[str]:
-    # v5 try, then fallback
-    q_v5 = """
-        MATCH (n)
-        WHERE toUpper(n.name) CONTAINS 'FOODON'
-        AND n.out_degree = 1
-        RETURN n.name_text AS item
-        LIMIT $limit
-        """
-
-
-    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
-    try:
-        with driver.session() as s:
-            try:
-                rows = s.run(q_v5, limit=limit)
-                data = [r["item"] for r in rows if r["item"]]
-                if data:
-                    return data
-            except CypherSyntaxError:
-                pass
-
-    finally:
-        driver.close()
-
-# ------------- Heuristics (fallbacks) -------------
-def heuristic_stage_one(item: str) -> str:
-    it = (item or "").lower().strip()
-    prepared_cues = [
-        "fried","baked","grilled","roasted","stir-fry","sauteed","cooked",
-        "boiled","braised","broth","soup","stew","salad","curry","tacos",
-        "burrito","sandwich","wrap","pizza","pasta","burger","omelette",
-        "noodle","rice bowl","ramen","dumpling","casserole","stewed",
-        "sautéed","sauté","fried rice","stir fry","biryani","enchilada",
-        "samosa","kebab","roll","cooked meal","entrée","prepared dish"
-    ]
-    if any(w in it for w in prepared_cues):
-        return "prepared_dish"
-
-    raw_cues = [
-        "raw","fresh","paddy","grain","leaf","seed","fruit","vegetable",
-        "bean","lentil","legume","tuber","root","nut","herb","spice",
-        "flower","mushroom","shoot","sprout","stem","whole","green",
-        "unpolished","unprocessed","uncooked","farm","produce"
-    ]
-    if any(w in it for w in raw_cues):
-        return "raw_commodity"
-
-    processed_cues = [
-        "powder","paste","sauce","oil","flour","noodles","snack","chips",
-        "frozen","instant","canned","jar","pickled","dried","dehydrated",
-        "fermented","sweetened","salted","syrup","extract","essence",
-        "concentrate","mix","blend","spread","butter","jam","preserve",
-        "marinated","ready to eat","packaged","processed"
-    ]
-    if any(w in it for w in processed_cues):
-        return "processed_product"
-
-    return "processed_product"
-
-def heuristic_stage(items: List[str]) -> Dict[str, str]:
-    return {it: heuristic_stage_one(it) for it in items}
-
-ETHNIC_CUES = [
-    ("Indian Grocery", [
-        "basmati","poha","idli","dosa","ghee","masala","turmeric",
-        "urad dal","chana dal","moong dal","hing","paneer","atta",
-        "besan","tamarind","curry leaves","mustard seeds","cumin",
-        "fennel","cardamom","clove","fenugreek","sambar powder",
-        "biryani masala","kashmiri chili","garam masala","jaggery",
-        "any product of Indian or South Asian origin"
-    ]),
-    ("Pakistani Grocery", ["nihari masala","shan masala","haleem","achar","seviyan"]),
-    ("Bangladeshi Grocery", ["ilish","mustard oil","pitha","shutki"]),
-    ("Nepali / Bhutanese Grocery", ["momo","thukpa","sel roti","gundruk"]),
-    ("Mexican Grocery", ["masa","maseca","jalapeño","chipotle","tortilla","epazote"]),
-    ("East Asian Grocery", ["nori","miso","kimchi","udon","matcha","gochujang","ramen"]),
-    ("Chinese Grocery", ["doubanjiang","shaoxing","sichuan pepper","hoisin"]),
-    ("Japanese Grocery", ["katsuobushi","kombu","mirin","dashi","panko","sake"]),
-    ("Korean Grocery", ["gochugaru","doenjang","kimchi","tteokbokki"]),
-    ("Southeast Asian Grocery", ["lemongrass","galangal","laksa","belacan","pho","fish sauce"]),
-    ("Thai Grocery", ["green curry","red curry","palm sugar"]),
-    ("Vietnamese Grocery", ["pho noodles","nuoc mam","rice paper"]),
-    ("Indonesian Grocery", ["tempeh","sambal","rendang"]),
-    ("Filipino Grocery", ["adobo","pandesal","ube","bagoong"]),
-    ("Middle Eastern Grocery", ["tahini","sumac","za'atar","bulgur","labneh"]),
-    ("Mediterranean Grocery", ["olive oil","feta","halloumi","olives"]),
-    ("African Grocery", ["injera","berbere","teff","fufu","egusi"]),
-    ("Italian Grocery", ["pasta","olive oil","parmesan","risotto"]),
-    ("French Grocery", ["baguette","brie","herbes de provence","dijon"]),
-    ("Eastern European Grocery", ["borscht","sauerkraut","pierogi","kielbasa"]),
-    # U.S. regional
-    ("American Southern Grocery", ["grits","cajun"]),
-    ("Cajun / Creole Grocery", ["gumbo base","jambalaya mix","beignet"]),
-    ("Tex-Mex Grocery", ["queso","enchilada","fajita"]),
-    ("Hawaiian Grocery", ["spam","poke"]),
-    ("New England Grocery", ["clam chowder","cranberry"]),
-    ("California Grocery", ["avocado","sourdough","kombucha"]),
-    ("General American Grocery", [])
-]
-
-COUNTRY_CUES = [
-    ("India", ["basmati","idli","dosa","poha","turmeric","hing","toor dal","ghee","paneer","biryani","tamarind"]),
-    ("China", ["doubanjiang","sichuan","hoisin","soy sauce","bok choy"]),
-    ("Japan", ["nori","matcha","katsuobushi","mirin","ramen","miso","wasabi"]),
-    ("Korea", ["kimchi","gochujang","doenjang","bibimbap","soju"]),
-    ("Thailand", ["galangal","lemongrass","kaffir lime","fish sauce","green curry"]),
-    ("Vietnam", ["pho","nuoc mam","rice paper","bun cha"]),
-    ("Mexico", ["masa","jalapeño","chipotle","tomatillo","achiote"]),
-    ("Italy", ["pasta","risotto","pesto","mozzarella","parmesan"]),
-    ("France", ["baguette","brie","camembert","crème fraîche","truffle"]),
-    ("Greece", ["feta","kalamata","tzatziki","dolma"]),
-    ("Ethiopia", ["injera","berbere","teff"]),
-    ("United States (General)", ["burger","barbecue","mac and cheese","hot dog","apple pie"]),
-]
-
-def heuristic_ethnic(item: str) -> str:
-    it = (item or "").lower()
-    for label, keys in ETHNIC_CUES:
-        if any(k in it for k in keys):
-            return label
-    return "General American Grocery"
-
-def _strip_diacritics(s: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
-
-def _normalize(s: str) -> str:
-    return _strip_diacritics((s or "").lower().strip())
-
-def _token_to_pattern(tok: str) -> re.Pattern:
-    t = _normalize(tok)
-    t = re.escape(t).replace(r"\ ", r"\s+")
-    opt_plural = r"(?:s)?" if re.search(r"[a-z]$", t) else ""
-    return re.compile(rf"\b{t}{opt_plural}\b", flags=re.IGNORECASE)
-
-def _compile_table(cues: List[Tuple[str, List[str]]]):
-    return [(label, [_token_to_pattern(k) for k in keys]) for label, keys in cues]
-
-def _any_match(text_norm: str, pats: List[re.Pattern]) -> bool:
-    return any(p.search(text_norm) for p in pats)
-
-_US_PRIORITY = {
-    "united states (general)",
-    "southern united states",
-    "cajun / creole",
-    "tex-mex",
-    "new england",
-    "midwest",
-    "pacific northwest",
-    "southwest",
-    "hawaiian",
-    "appalachian",
-    "california",
-    "new york",
-    "chicago",
-    "louisiana",
-    "texas",
-    "florida",
-    "alaska",
-}
-
-_FALLBACK_BUCKETS = [
-    ("Imported (Likely East Asia)", ["miso","kombu","nori","ramen","dashi","gochujang","doenjang","kimchi","mirin","tamari"]),
-    ("Imported (Likely South/Southeast Asia)", ["tamarind","garam masala","hing","jaggery","lemongrass","galangal","laksa","belacan","fish sauce"]),
-    ("Imported (Likely Latin America)", ["achiote","epazote","tomatillo","masa","guajillo","ancho","aji amarillo"]),
-    ("Imported (Likely Middle East/Mediterranean)", ["tahini","za'atar","labneh","bulgur","sumac","harissa"]),
-    ("Imported (Likely Africa)", ["berbere","teff","injera","egusi","fufu","jollof"]),
-    ("Imported (Likely Europe)", ["parmesan","mozzarella","prosciutto","manchego","brie","camembert"]),
-]
-
-@lru_cache(maxsize=1)
-def _compiled_country():
-    return _compile_table(tuple(COUNTRY_CUES))
-
-@lru_cache(maxsize=1)
-def _compiled_ethnic():
-    return _compile_table(tuple(ETHNIC_CUES))
-
-@lru_cache(maxsize=1)
-def _compiled_fallback():
-    return _compile_table(tuple(_FALLBACK_BUCKETS))
-
-def heuristic_origin(item: str) -> str:
-    it = _normalize(item)
-    # 1) Country-level matches
-    for country, pats in _compiled_country():
-        if _any_match(it, pats):
-            return country
-    # 2) Ethnic categories (as coarse origin hints)
-    for label, pats in _compiled_ethnic():
-        if _any_match(it, pats):
-            return label
-    # 3) Fallback buckets
-    for label, pats in _compiled_fallback():
-        if _any_match(it, pats):
-            return label
-    # 4) Default
-    return "Domestic (USA)"
-
-def heuristic_us_cert(item: str, stage: str) -> str:
-    it = (item or "").lower()
-    if stage == "prepared_dish":
-        return "Local Health Department"
-    if "organic" in it:
-        return "USDA Organic"
-    if any(k in it for k in ["meat","poultry","egg product"]) or "raw milk" in it:
-        return "USDA FSIS"
-    if stage == "raw_commodity":
-        return "USDA/APHIS"
-    return "FDA"
-
-# ------------- LLM calls (classification) -------------
-def get_stage_default(it: str) -> str:
-    return "processed_product"
-
-@retry(max_tries=3, base_delay=0.5)
-def classify_stage_via_llm(items: List[str]) -> Dict[str, str]:
-    client = get_openai_client()
-    if client is None or not items:
-        logger.info("LLM unavailable; using stage heuristics.")
-        return heuristic_stage(items)
-    sys = "Classify each food term into exactly one of: raw_commodity, processed_product, prepared_dish."
-    out: Dict[str,str] = {}
-    for chunk in batched(items, 100):
-        user = "Return ONLY a JSON object mapping item->stage (no extra text). Items:\n" + json.dumps(chunk, ensure_ascii=False)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.0,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        obj = json_relaxed_load(resp.choices[0].message.content.strip())
-        if not isinstance(obj, dict):
-            obj = {}
-        for k in chunk:
-            v = str(obj.get(k, "")).strip().lower()
-            out[k] = v if v in TEMPLATE_BY_STAGE else heuristic_stage_one(k)
-    return out
-
-@retry(max_tries=3, base_delay=0.5)
-def infer_ethnic_market_via_llm(items: List[str]) -> Dict[str, str]:
-    client = get_openai_client()
-    if client is None or not items:
-        logger.info("LLM unavailable; using ethnic heuristics.")
-        return {it: heuristic_ethnic(it) for it in items}
-    sys = (
-        "For each food name, assign the most likely U.S. retail ethnic market segment. "
-        "Choose from a concise set such as: 'Indian Grocery', 'Mexican Grocery', 'East Asian Grocery', "
-        "'Southeast Asian Grocery', 'Middle Eastern Grocery', 'General American Grocery'."
-    )
-    out: Dict[str,str] = {}
-    for chunk in batched(items, 100):
-        user = "Return ONLY a JSON object mapping item->ethnic_segment. Items:\n" + json.dumps(chunk, ensure_ascii=False)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.0,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        obj = json_relaxed_load(resp.choices[0].message.content.strip())
-        if not isinstance(obj, dict):
-            obj = {}
-        for k in chunk:
-            out[k] = (str(obj.get(k, "")).strip() or heuristic_ethnic(k))
-    return out
-
-@retry(max_tries=3, base_delay=0.5)
-def infer_import_origin_via_llm(items: List[str]) -> Dict[str, str]:
-    client = get_openai_client()
-    if client is None or not items:
-        logger.info("LLM unavailable; using origin heuristics.")
-        return {it: heuristic_origin(it) for it in items}
-    sys = (
-        "For each food item, estimate the most likely country or region of origin when sold in the U.S. retail market. "
-        "If domestically produced, return 'Domestic (USA)'. Otherwise a country ('India', 'Mexico') or region ('Middle East')."
-    )
-    out: Dict[str,str] = {}
-    for chunk in batched(items, 100):
-        user = "Return ONLY a JSON object mapping item->origin. Items:\n" + json.dumps(chunk, ensure_ascii=False)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.0,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        obj = json_relaxed_load(resp.choices[0].message.content.strip())
-        if not isinstance(obj, dict):
-            obj = {}
-        for k in chunk:
-            out[k] = (str(obj.get(k, "")).strip() or heuristic_origin(k))
-    return out
-
-@retry(max_tries=3, base_delay=0.5)
-def infer_us_cert_authority_via_llm(items: List[str], stages: Dict[str, str]) -> Dict[str, str]:
-    client = get_openai_client()
-    if client is None or not items:
-        logger.info("LLM unavailable; using certification heuristics.")
-        return {it: heuristic_us_cert(it, stages.get(it, "processed_product")) for it in items}
-    sys = (
-        "For each item, output the most relevant U.S. certification or oversight authority at point-of-sale: "
-        "Examples: 'USDA Organic', 'USDA/APHIS', 'USDA FSIS', 'FDA', 'Local Health Department'. "
-        "Use 'Local Health Department' for prepared dishes at restaurants."
-    )
-    out: Dict[str,str] = {}
-    for chunk in batched(items, 75):
-        payload = [{"item": it, "stage": stages.get(it, "processed_product")} for it in chunk]
-        user = "Return ONLY a JSON object mapping item->authority. Inputs:\n" + json.dumps(payload, ensure_ascii=False)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=0.0,
-            messages=[{"role":"system","content":sys},{"role":"user","content":user}]
-        )
-        obj = json_relaxed_load(resp.choices[0].message.content.strip())
-        if not isinstance(obj, dict):
-            obj = {}
-        for k in chunk:
-            v = str(obj.get(k, "")).strip()
-            out[k] = v or heuristic_us_cert(k, stages.get(k, "processed_product"))
-    return out
-
-# ------------- Heuristic plausibility gate -------------
-def is_relation_plausible(item: str, rel: str, org: str, stage: str) -> Tuple[bool, str]:
-    """Cheap rule-based filter before the LLM validator."""
-    txt = _normalize(item)
-    rel_l = rel.lower()
-    org_l = _normalize(org)
-
-    # Item categories
-    is_pickle_like = any(k in txt for k in ["pickle", "pickled", "achar", "kimchi"])
-    is_coffee_like = any(k in txt for k in ["coffee", "espresso", "arabica", "robusta"])
-    is_tea_like = any(k in txt for k in ["tea", "matcha"])
-    is_spice_like = any(k in txt for k in ["spice", "masala", "chili", "turmeric", "cumin", "cardamom", "clove", "pepper", "coriander"])
-    is_raw = (stage == "raw_commodity")
-
-    # Orgs that shouldn't process
-    non_processing_orgs = ["importer","distributor","wholesaler","supermarket","convenience","marketplace","restaurant","caterer","ghost kitchen","food truck"]
-    if rel_l in {"roasted_by","baked_by","brewed_by","fermented_by","confected_by","ground_by","pressed_by","aged_by","processed_by"}:
-        if any(k in org_l for k in non_processing_orgs):
-            return False, f"{org} is not a processing facility for '{rel}'."
-
-    # Pickles & ferments
-    if is_pickle_like and rel_l in {"baked_by","roasted_by"}:
-        return False, "Pickled/fermented items are not baked/roasted."
-
-    # Coffee rules
-    if is_coffee_like:
-        if rel_l in {"baked_by","fermented_by"}:
-            return False, "Coffee is roasted/ground, not baked or fermented at winery."
-        if rel_l in {"roasted_by","ground_by"} and not any(k in org_l for k in ["roast", "grind", "coffee"]):
-            return False, "Coffee should be roasted/ground by a roastery/grinder."
-
-    # Tea rules
-    if is_tea_like and rel_l in {"brewed_by","fermented_by"} and "kombucha" not in txt:
-        # tea leaves as product shouldn't be 'brewed_by' in supply chain sense
-        return False, "Tea as a retail product isn't 'brewed_by' in supply chain relations."
-
-    # Spices
-    if is_spice_like and rel_l in {"baked_by","brewed_by"}:
-        return False, "Spices are typically ground/processed, not baked/brewed."
-
-    # Raw commodities not baked/roasted/fermented (except coffee/cocoa)
-    if is_raw and rel_l in {"baked_by","roasted_by","brewed_by","fermented_by","confected_by","aged_by"}:
-        if not any(k in txt for k in ["coffee", "cocoa", "cacao"]):
-            return False, f"Raw commodities generally aren't '{rel}' directly."
-
-    return True, ""
-
-# ------------- LLM triple validation (batch) -------------
-def _format_triple(item: str, rel: str, org: str, stage: str) -> str:
-    return f"({item}) -[{rel.replace('_', ' ')}]-> ({org})  [stage={stage}]"
-
-@retry(max_tries=3, base_delay=0.6)
-def llm_validate_triples(candidates: List[Tuple[str, str, str, str]]) -> Dict[int, Dict[str, Any]]:
-    """
-    Validate triples with an LLM in batches.
-    Input: list of (item, rel, org, stage)
-    Output: dict[idx] = {"ok": bool, "reason": "<text>"}
-    """
-    client = get_openai_client()
-    if not client:
-        return {i: {"ok": True, "reason": ""} for i, _ in enumerate(candidates)}
-
-    sys = (
-        "You are a strict food-supply-chain validator. "
-        "Given item–relation–organization triples, decide if each triple is plausible. "
-        "Consider the item's nature (pickled, coffee, spice, meat, seafood, beverage), the verb "
-        "(baked_by, roasted_by, brewed_by, fermented_by, processed_by, ground_by, pressed_by, aged_by), also add an additional col "
-        "For relation return confidence score as the fourth fileld "
-        "interpreted as likelihood the triple is correct in real supply chains. "
-        "Calibration guide: 0.95=very standard, 0.75=plausible, 0.5=uncertain, 0.25=unlikely, 0.05=wrong. "
-        "and whether the organization type (bakery, roastery, picklery/fermenter, winery, butcher, distributor, supermarket, restaurant) "
-        "normally performs that action consider what is normal example bread baked at bekary but pickle baked at bakery is not a rlation.\n"
-        "Rules of thumb should be maintained :\n"
-        "- Pickled products are not baked_by or roasted_by.\n"
-        "- Coffee is roasted_by/ground_by (not baked_by or fermented_by).\n"
-        "- Breweries brew; wineries/cideries ferment; bakeries bake; roasteries roast; pickleries/fermenters ferment/process.\n"
-        "- Distributors/wholesalers/supermarkets sell/purchase/transport; they do not roast/bake/brew/ferment.\n"
-        "- Raw commodities are not baked/roasted/fermented unless contextually appropriate (e.g., coffee/cocoa beans -> roasted).\n"
-        "Output ONLY JSON list: [{\"idx\": <int>, \"ok\": true|false, \"reason\": \"...\"}]"
-    )
-
-    out: Dict[int, Dict[str, Any]] = {}
-    for chunk in batched(list(enumerate(candidates)), 60):
-        payload = [
-            {
-                "idx": i,
-                "item": it,
-                "relation": rel,
-                "organization": org,
-                "stage": stage,
-                "triple_pretty": _format_triple(it, rel, org, stage),
-            }
-            for i, (it, rel, org, stage) in chunk
-        ]
-        user = "Validate these triples. Return ONLY JSON as described.\n" + json.dumps(payload, ensure_ascii=False)
-        resp = client.chat.completions.create(
-            model=OPENAI_VALIDATOR_MODEL,
-            temperature=0.0,
-            messages=[{"role":"system","content":sys}, {"role":"user","content":user}]
-        )
-        try:
-            arr = json_relaxed_load(resp.choices[0].message.content.strip())
-            if not isinstance(arr, list):
-                raise ValueError("validator returned non-list JSON")
-            for obj in arr:
-                i = int(obj.get("idx"))
-                ok = bool(obj.get("ok"))
-                reason = str(obj.get("reason", "")).strip()
-                out[i] = {"ok": ok, "reason": reason}
-        except Exception as e:
-            for i, _ in chunk:
-                out[i] = {"ok": True, "reason": f"validator parse error: {e}"}
-    return out
-
-# ------------- synthesis to fixed triples -------------
-def synthesize_triples(
-    items: List[str],
-    stages: Dict[str, str],
-    ethnic: Dict[str, str],
-    origin: Dict[str, str],
-    cert: Dict[str, str]
-) -> List[List[str]]:
-    allowed = set(FIXED_RELS)
-    triples: List[List[str]] = []
-    skipped: List[Tuple[str,str,str,str,str]] = []  # (item, stage, rel, org, reason)
-
-    # 1) Collect stage-chain candidates via template + heuristic gate
-    stage_candidates: List[Tuple[str,str,str,str]] = []  # (item, rel, org, stage)
-    for it in items:
-        stage = stages.get(it, get_stage_default(it))
-        for rel, org in TEMPLATE_BY_STAGE.get(stage, []):
-            if rel not in allowed:
-                raise ValueError(f"Template used non-allowed relation: {rel}")
-            ok, reason = is_relation_plausible(it, rel, org, stage)
-            if ok:
-                stage_candidates.append((it, rel, org, stage))
-            else:
-                skipped.append((it, stage, rel, org, f"heuristic: {reason}"))
-
-    # 2) LLM validate (optional)
-    if VALIDATE_WITH_LLM and stage_candidates:
-        verdicts = llm_validate_triples(stage_candidates)
-    else:
-        verdicts = {i: {"ok": True, "reason": ""} for i in range(len(stage_candidates))}
-
-    # 3) Emit stage-chain triples allowed by both gates
-    for i, (it, rel, org, stage) in enumerate(stage_candidates):
-        if verdicts.get(i, {}).get("ok", True):
-            triples.append([it, rel, org])
-        else:
-            reason = verdicts[i].get("reason", "")
-            skipped.append((it, stage, rel, org, f"llm: {reason}"))
-
-    # 4) Tags & certification
-    for it in items:
-        seg = (ethnic.get(it) or "").strip()
-        if seg:
-            triples.append([it, "is_EthnicElement_Of", seg])
-
-        src = (origin.get(it) or "").strip()
-        if src:
-            triples.append([it, "is_imported_From", src])
-
-        stage = stages.get(it, get_stage_default(it))
-        auth = (cert.get(it) or "").strip()
-        if auth:
-            if stage in ("raw_commodity", "processed_product"):
-                triples.append([it, "certified_by", auth])
-            elif stage == "prepared_dish" and auth.lower() == "local health department":
-                triples.append([it, "certified_by", auth])
-
-    if skipped:
-        logger.info("Skipped %d triples (heuristic/LLM).", len(skipped))
-        for (itm, stg, rel, org, why) in skipped[:50]:
-            logger.debug("SKIP  %s  stage=%s  rel=%s  org=%s  reason=%s", itm, stg, rel, org, why)
-        if len(skipped) > 50:
-            logger.debug("... and %d more", len(skipped) - 50)
-
-    return triples
-
-# ------------- CSV -------------
-CSV_HEADER = ["food_item", "relation", "org_or_value", "score"]
-
-def write_csv(triples: List[List[str]], path: str):
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(CSV_HEADER)
-        w.writerows(triples)
-
-# ------------- diagnostics -------------
-def diagnostics_report(
-    items: List[str],
-    stages: Dict[str, str],
-    ethnic: Dict[str, str],
-    origin: Dict[str, str],
-    cert: Dict[str, str],
-    triples: List[List[str]]
-) -> Dict[str, Any]:
-    rel_counts = Counter(t[1] for t in triples)
-    stage_counts = Counter(stages.values())
-    return {
-        "num_items": len(items),
-        "stage_counts": dict(stage_counts),
-        "relation_counts": dict(rel_counts),
-        "ethnic_segment_examples": {k: ethnic[k] for k in list(ethnic)[:8]},
-        "import_origin_examples": {k: origin[k] for k in list(origin)[:8]},
-        "cert_authority_examples": {k: cert[k] for k in list(cert)[:8]},
-    }
-
-# ------------- Prompt + Cypher generation -------------
-
-PROMPT_HEADER = """You are a Neo4j + Food System Ontology expert operating in a regulated, multi-ontology environment.
-
-───────────────────────────────────────────────────────────────
-🎯 GOAL
-───────────────────────────────────────────────────────────────
-Given a food item f, generate Cypher code that builds *only plausible and legally valid* relationships between
-the food item and all relevant business entities in the Food System Ontology.
-
-Each emitted Cypher block must:
-1. Use MATCH to anchor existing ontology nodes (FSConcept hierarchy);
-2. Use MERGE for instance creation (FoodItem, FoodBusiness, Organization, Regulation, etc.);
-3. Guarantee idempotency, semantic correctness, and full ontology connectivity (each subclass chain must reach FoodSystem).
-
-───────────────────────────────────────────────────────────────
-📥 INPUT
-───────────────────────────────────────────────────────────────
-food_item_name: {food_item_name}
-region: {region}
-relationship_set:
-  [grown_by, processed_by, manufactured_by, packaged_by,
-   transported_by, supplied_by, stored_by, sold_by,
-   certified_by, is_menu_item_of]
-
-ontology_top_classes:
-  Root → FoodSystem →
-    {{ FoodProduction, FoodProcessing, FoodDistribution,
-      FoodConsumption, FoodWasteManagement, FoodGovernance,
-      FoodProductionInput, FoodChainInfrastructure }}
-
-optional_metadata:
-  - cold_chain_required: {cold_chain_required}
-  - processing_level: {processing_level}
-  - class: {item_class}
-  - ethnic_tags: {ethnic_tags}
-  - certification_required: {certification_required}
-  - retail_channels_allowed: {retail_allowed}
-  - retail_channels_blocked: {retail_blocked}
-  - legality_flags: {legality_flags}
-  - data_source: {data_source}
-  - created_by_model: {created_by_model}
-  - confidence_score: {confidence_score}
-  - timestamp: {timestamp}
-
-───────────────────────────────────────────────────────────────
-🧮 INFERENCE RULES
-───────────────────────────────────────────────────────────────
-1. **Ontology Anchoring**
-   MATCH all required FSConcept nodes:
-   FoodProduction, FoodProcessing, FoodDistribution,
-   FoodGovernance, Restaurant, GroceryStore, etc.
-   If a required FSConcept node is missing, MERGE it
-   with property `status:'inferred'`.
-
-2. **Relationship Applicability**
-   Apply these default filters:
-   • wildlife_restricted (region="US"): GroceryStore/RetailDistribution
-      Restaurant, StreetFood.
-   • processed_plant_food:  all processing + packaging;  cold_chain.
-   • staple: full production→retail chain.
-   • seafood:  cold_chain,  certification.
-   • prepared_food:  restaurants only.
-   • beverage: manufacturer + distributor + retail.
-   • produce: farm + wholesaler + grocery + restaurant.
-   Skip illegal or implausible edges with a comment:
-   `// OMITTED: <reason>`.
-
-3. **Ethnic Inference**
-   Derive ethnic business subtypes from `ethnic_tags`
-   or linguistic cues in `food_item_name`:
-   "samosa" → IndianRestaurant
-   "tacos" → MexicanRestaurant
-   "bamboo shoot" → ThaiRestaurant, ChineseRestaurant.
-
-4. **Regulatory Integration**
-   If certification_required or regional rule applies:
-   MERGE (f)-[:regulated_under]->(:Regulation {{name:'<applicable law>'}})
-   MERGE (f)-[:certified_by]->(:Organization {{name:'<cert body>'}})
-   Optionally tag each regulation node with `jurisdiction`, `citation`, and `regulation_status`.
-
-5. **External Ontology Mapping**
-   MERGE (f)-[:mapped_to]->(:ExternalConcept
-         {{source:'FoodOn', id:'{foodon_id}', match_confidence:{mapping_conf}}})
-   Add additional mappings to AGROVOC/NALT if available.
-
-6. **Sustainability / Waste Hooks**
-   Optionally:
-   (f)-[:produces_waste]->(:FoodWasteType {{name:'ProcessingResidue'}})
-   (f)-[:recycled_into]->(:UpcycledProduct {{name:'Compost'}})
-
-7. **Provenance Recording**
-   Every generated graph includes:
-   (f)-[:inferred_by]->(:Model
-         {{name:'{created_by_model}', prompt_version:'v6',
-          confidence:{confidence_score}, timestamp:'{timestamp}'}})
-
-8. **Node Property Discipline**
-   Each MERGE for business nodes should include:
-     name, role, region, supply_chain_stage, scale
-   Example:
-     MERGE (riceMill:FoodBusiness
-            {{name:'RiceMill', role:'Processor',
-             region:'{region}', supply_chain_stage:'processing', scale:'industrial'}})
-
-9. **Uniqueness Constraints**
-   (add once per database)
-   CREATE CONSTRAINT IF NOT EXISTS FOR (n:FoodItem) REQUIRE n.name IS UNIQUE;
-   CREATE CONSTRAINT IF NOT EXISTS FOR (n:FSConcept) REQUIRE n.name IS UNIQUE;
-
-10. **Lifecycle and Temporal Attributes**
-    Set timestamps on creation:
-    ON CREATE SET f.created_at=datetime().
-
-───────────────────────────────────────────────────────────────
-📤 OUTPUT REQUIREMENTS
-───────────────────────────────────────────────────────────────
-- Only executable Cypher code.
-- Use headers:
-  // --- FOOD PRODUCTION ---
-  // --- FOOD PROCESSING ---
-  etc.
-- Include explanatory comments for each relationship block.
-- Optionally append a JSON summary block at the end.
-"""
-
-def build_prompt_for_item(
-    food_item_name: str,
-    region: str,
-    item_class: str,
-    processing_level: str,
-    ethnic_tags,
-    certification_required: bool,
-    cold_chain_required: bool,
-    foodon_id: str | None,
-    mapping_conf: float,
-    retail_allowed=None,
-    retail_blocked=None,
-    legality_flags=None,
-    data_source="FoodOn",
-    created_by_model="GPT-5",
-    confidence_score=0.72,
-    timestamp=None,
-):
-    ts = timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    return PROMPT_HEADER.format(
-        food_item_name=food_item_name,
-        region=region,
-        cold_chain_required=str(cold_chain_required).lower(),
-        processing_level=processing_level,
-        item_class=item_class,
-        ethnic_tags=json.dumps(ethnic_tags or [], ensure_ascii=False),
-        certification_required=str(certification_required).lower(),
-        retail_allowed=json.dumps(retail_allowed or [], ensure_ascii=False),
-        retail_blocked=json.dumps(retail_blocked or [], ensure_ascii=False),
-        legality_flags=json.dumps(legality_flags or {}, ensure_ascii=False),
-        data_source=data_source,
-        created_by_model=created_by_model,
-        confidence_score=confidence_score,
-        timestamp=ts,
-        foodon_id=(foodon_id or ""),
-        mapping_conf=mapping_conf,
-    )
-
-@retry(max_tries=3, base_delay=0.8)
-def generate_cypher_for_item(food_item_name: str, meta: Dict[str, Any]) -> str:
-    client = get_openai_client()
-    if client is None:
-        return f"""// Fallback Cypher (LLM unavailable)
-MERGE (f:FoodItem {{name:{json.dumps(food_item_name)}}})
-ON CREATE SET f.created_at=datetime()
-WITH f
-MERGE (root:FSConcept {{name:'FoodSystem'}})
-MERGE (f)-[:part_of]->(root)
-// TODO: Expand with processing, distribution, and regulation nodes
-"""
-    prompt = build_prompt_for_item(food_item_name=food_item_name, **meta)
-    sys = "Generate ONLY executable Cypher per the prompt's Output Requirements. Do not include explanations outside comments."
-    resp = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0,
-        messages=[
-            {"role":"system","content":sys},
-            {"role":"user","content":prompt}
-        ]
-    )
-    return _strip_code_fences(resp.choices[0].message.content.strip())
-
-# ------------- metadata mappers for prompt -------------
-def map_stage_to_processing_level(stage: str) -> str:
-    if stage == "raw_commodity":
-        return "raw"
-    if stage == "prepared_dish":
-        return "tertiary"
-    return "secondary"
-
-def map_item_class(item: str, stage: str) -> str:
-    t = (item or "").lower()
-    if any(k in t for k in ["salmon","shrimp","fish","tuna","mackerel"]):
-        return "seafood"
-    if any(k in t for k in ["beef","pork","chicken","lamb","meat"]):
-        return "meat"
-    if stage == "prepared_dish":
-        return "prepared_food"
-    if any(k in t for k in ["juice","tea","coffee","soda","drink","beverage","milk"]):
-        return "beverage"
-    if any(k in t for k in ["apple","lettuce","spinach","tomato","mango","banana"]):
-        return "produce"
-    if any(k in t for k in ["rice","wheat","corn","grain","lentil","bean"]):
-        return "staple"
-    return "processed_plant_food"
-
-def ethnicity_tags_from_label(label: str) -> list[str]:
-    if not label or label == "General American Grocery":
-        return []
-    return [label.replace(" Grocery","")]
-
-def certification_required_from_class(c: str) -> bool:
-    return c in ("seafood","meat","prepared_food")
-
-# ------------- CLI -------------
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--limit", type=int, default=ITEM_LIMIT)
-    p.add_argument("--output", default=OUTPUT_CSV)
-    p.add_argument("--items-file", help="Optional newline-delimited items file")
-    p.add_argument("--emit-cypher", action="store_true", help="Emit Cypher per item using the regulated prompt")
-    p.add_argument("--region", default=REGION)
-    p.add_argument("--cypher-dir", default=CYPHER_DIR)
-    return p.parse_args()
-
-# ------------- main -------------
-def main():
-    args = parse_args()
-    st = State()
-
-    # 1) Items
-    if args.items_file:
-        with open(args.items_file, "r", encoding="utf-8") as f:
-            st.items = [line.strip() for line in f if line.strip()]
-    else:
-        st.items = fetch_items_via_cypher(args.limit)
-
-    # sanitize & dedupe
-    st.items = list(dict.fromkeys(x.strip() for x in st.items if x and x.strip()))
-    if not st.items:
-        print("No items returned.")
-        return
-    print(f"Items: {len(st.items)} (sample: {st.items[:5]})")
-
-    # 2) Stage
-    if llm_available():
-        st.item_stage = classify_stage_via_llm(st.items)
-    else:
-        st.item_stage = heuristic_stage(st.items)
-
-    # 3) Ethnic market segment
-    if llm_available():
-        st.ethnic_market = infer_ethnic_market_via_llm(st.items)
-    else:
-        st.ethnic_market = {it: heuristic_ethnic(it) for it in st.items}
-
-    # 4) Import origin
-    if llm_available():
-        st.import_origin = infer_import_origin_via_llm(st.items)
-    else:
-        st.import_origin = {it: heuristic_origin(it) for it in st.items}
-
-    # 5) U.S. certification authority
-    if llm_available():
-        st.us_cert_authority = infer_us_cert_authority_via_llm(st.items, st.item_stage)
-    else:
-        st.us_cert_authority = {it: heuristic_us_cert(it, st.item_stage.get(it, "processed_product")) for it in st.items}
-
-    # 6) Synthesize triples (strict fixed relations) with validation
-    st.triples = synthesize_triples(
-        st.items, st.item_stage, st.ethnic_market, st.import_origin, st.us_cert_authority
-    )
-
-    # 7) Write CSV
-    write_csv(st.triples, args.output)
-
-    # 8) Diagnostics
-    st.diagnostics = diagnostics_report(
-        st.items, st.item_stage, st.ethnic_market, st.import_origin, st.us_cert_authority, st.triples
-    )
-    print(f"✅ Wrote {len(st.triples)} triples to {args.output}")
-    print("Stages:", st.diagnostics["stage_counts"], " Relations:", st.diagnostics["relation_counts"])
-    print(json.dumps(st.diagnostics, indent=2))
-
-    # 9) Optional: Cypher emission (regulated prompt)
-    if args.emit_cypher or EMIT_CYPHER:
-        outdir = Path(args.cypher_dir)
-        outdir.mkdir(parents=True, exist_ok=True)
-        print(f"🔧 Emitting Cypher to: {outdir.resolve()} (region={args.region})")
-        for it in st.items:
-            stage = st.item_stage.get(it, "processed_product")
-            item_class = map_item_class(it, stage)
-            processing_level = map_stage_to_processing_level(stage)
-            tags = ethnicity_tags_from_label(st.ethnic_market.get(it, ""))
-            cert_req = certification_required_from_class(item_class)
-            cold_chain = item_class in ("seafood","prepared_food")
-            meta = dict(
-                region=args.region,
-                item_class=item_class,
-                processing_level=processing_level,
-                ethnic_tags=tags,
-                certification_required=cert_req,
-                cold_chain_required=cold_chain,
-                retail_allowed=[],
-                retail_blocked=[],
-                legality_flags={"region": args.region},
-                data_source="FoodOn",
-                created_by_model="GPT-5",
-                confidence_score=0.98,
-                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                foodon_id=None,
-                mapping_conf=0.85,
-            )
-            cypher = generate_cypher_for_item(it, meta)
-            fname = outdir / (re.sub(r"[^\w.-]+", "_", it) + ".cypher")
-            with open(fname, "w", encoding="utf-8") as f:
-                f.write(cypher + "\n")
-        print("✅ Cypher emission complete.")
-
-if __name__ == "__main__":
-    main()
+#!/usr/bin/env python3# -*- coding: utf-8 -*-"""Food triples (fixed relations) + optional Cypher generation via LLM.Features:- Pull items from Neo4j (or a text file).- Infer stage/ethnic/import/cert using LLM if available; fall back to heuristics.- Validate candidate triples with heuristics + optional LLM validator prompt.- Emit CSV of strict fixed relations.- (Optional) Emit per-item Cypher files using a regulated, ontology-anchored prompt.Env vars (can be overridden via CLI):  NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD  OPENAI_API_KEY, OPENAI_MODEL, OPENAI_VALIDATOR_MODEL  OUTPUT_CSV, ITEM_LIMIT  REGION, EMIT_CYPHER, CYPHER_DIR  VALIDATE_WITH_LLM  (true/false)"""import os, json, csv, re, time, logging, argparseimport sysfrom typing import List, Dict, Any, Tuplefrom dataclasses import dataclass, fieldfrom collections import Counterfrom functools import wraps, lru_cachefrom pathlib import Pathfrom dotenv import load_dotenvfrom neo4j import GraphDatabasefrom neo4j.exceptions import CypherSyntaxErrorimport unicodedata# ------------- load .env -------------load_dotenv()NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")OPENAI_VALIDATOR_MODEL = os.getenv("OPENAI_VALIDATOR_MODEL", OPENAI_MODEL)OUTPUT_CSV = os.getenv("OUTPUT_CSV", "food_relationships.csv")ITEM_LIMIT = int(os.getenv("ITEM_LIMIT", "200"))REGION = os.getenv("REGION", "US")EMIT_CYPHER = os.getenv("EMIT_CYPHER", "false").lower() in ("1","true","yes")CYPHER_DIR = os.getenv("CYPHER_DIR", "cypher_out")VALIDATE_WITH_LLM = os.getenv("VALIDATE_WITH_LLM", "false").lower() in ("1","true","yes")# ------------- logging -------------logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")logger = logging.getLogger("food-triples")# ------------- fixed relations (single source of truth) -------------FIXED_RELS = {    # ---------------------------------------------------------    # PRODUCTION / CULTIVATION    # ---------------------------------------------------------    "produced_by",    "cultivated_by",    "harvested_by",    "grown_by",    "raised_by",    "caught_by",    "foraged_by",    "bred_by",    "pollinated_by",    # Processing & Manufacturing    "processed_by",    "milled_by",    "pressed_by",    "fermented_by",    "distilled_by",    "brewed_by",    "roasted_by",    "ground_by",    "baked_by",    "churned_by",    "slaughtered_by",    "butchered_by",    "smoked_by",    "dried_by",    "cured_by",    # ---------------------------------------------------------    # PACKAGING / CERTIFICATION / SAFETY    # ---------------------------------------------------------    "packaged_by",    "labeled_by",    "certified_by",    "inspected_by",    "graded_by",    "tested_by",    "analyzed_by",    "sealed_by",    # ---------------------------------------------------------    # DISTRIBUTION / TRANSPORT / SALES / STORAGE    # ---------------------------------------------------------    "purchased_by",    "sold_by",    "transported_by",    "imported_by",    "exported_by",    "warehoused_by",    "stored_by",    "refrigerated_by",    "distributed_by",    "delivered_by",    # 🔹 Added for marketing & retail buckets:    "marketed_by",      # used in brand_marketing    "retailed_by",      # used in consumer_sales    "wholesaled_by",    # used in wholesale_distribution    # ---------------------------------------------------------    # PREPARATION / SERVING / CATERING    # ---------------------------------------------------------    "prepared_by",    "served_by",    "cooked_by",    "assembled_by",    "catered_by",    # ---------------------------------------------------------    # CULTURAL / CONSUMPTION / ETHNOGRAPHIC    # ---------------------------------------------------------    "consumed_by",    "is_traditional_to",    "is_staple_of",    "is_originated_from",    # ---------------------------------------------------------    # ADDITIONAL SPECIALTY RELATIONS    # ---------------------------------------------------------    "is_ingredient_in",    "is_substitute_for",    "is_preserved_by",    # ---------------------------------------------------------    # NON-BINARY TAG RELATIONS (retain as-is)    # ---------------------------------------------------------    "is_EthnicElement_Of",    "is_imported_From",}# ------------- stage templates (use only FIXED_RELS) -------------TEMPLATE_BY_STAGE = {"vegetables": [        ("grown_by", "Organic Vegetable Farm"),        ("grown_by", "Community Garden"),        ("grown_by", "Rooftop Garden"),        ("grown_by", "Hydroponic Lettuce Farm"),        ("grown_by", "Vertical Farming Operation"),        ("grown_by", "Market Garden"),        ("grown_by", "Greenhouse Tomato Producer"),        ("grown_by", "Urban Microgreens Farm"),        ("grown_by", "Potato Farm"),        ("grown_by", "Mushroom Cultivation Facility"),    ],    "animal_products": [        ("raised_by", "Free-range Chicken Farm"),        ("raised_by", "Grass-fed Beef Ranch"),        ("raised_by", "Heritage Pork Farm"),        ("raised_by", "Lamb Producer"),        ("raised_by", "Quail Egg Farm"),        ("raised_by", "Goat Dairy"),        ("raised_by", "Buffalo Ranch"),        ("raised_by", "Pastured Poultry Operation"),        ("raised_by", "Deer Farm"),        ("raised_by", "Rabbit Husbandry Facility"),    ],    "seafood": [        ("caught_by", "Tuna Fishing Fleet"),        ("caught_by", "Lobster Trap Operator"),        ("caught_by", "Salmon Fishing Vessel"),        ("caught_by", "Shellfish Harvesting Cooperative"),        ("caught_by", "Small-scale Crab Fishery"),        ("caught_by", "Deep Sea Fishing Operation"),        ("caught_by", "Coastal Fishing Boat"),        ("caught_by", "Squid Jigging Vessel"),        ("caught_by", "Artisanal Fisherman"),        ("caught_by", "Shrimp Trawler"),    ],    "crops": [        ("harvested_by", "Wheat Farm"),        ("harvested_by", "Coffee Plantation"),        ("harvested_by", "Apple Orchard"),        ("harvested_by", "Corn Producer"),        ("harvested_by", "Sugarcane Plantation"),        ("harvested_by", "Rice Paddy Farm"),        ("harvested_by", "Wild Blueberry Harvester"),        ("harvested_by", "Soybean Farm"),        ("harvested_by", "Cotton Farm"),        ("harvested_by", "Maple Syrup Producer"),    ],    "wild_foods": [        ("foraged_by", "Mushroom Hunter"),        ("foraged_by", "Wild Herb Forager"),        ("foraged_by", "Berry Foraging Collective"),        ("foraged_by", "Truffle Hunter"),        ("foraged_by", "Wild Onion Harvester"),        ("foraged_by", "Seaweed Harvester"),        ("foraged_by", "Acorn Gatherer"),        ("foraged_by", "Wild Rice Harvester"),        ("foraged_by", "Ramp Collector"),        ("foraged_by", "Dandelion Forager"),    ],    "specialty_crops_animals": [        ("bred_by", "Heritage Seed Farm"),        ("bred_by", "Heirloom Tomato Breeder"),        ("bred_by", "Apple Variety Developer"),        ("bred_by", "Cattle Genetics Company"),        ("bred_by", "Rare Poultry Breeder"),        ("bred_by", "Ornamental Fish Hatchery"),        ("bred_by", "Prize Pig Breeder"),        ("bred_by", "Drought-Resistant Crop Developer"),        ("bred_by", "Horse Stud Farm"),        ("bred_by", "Butterfly Breeding Facility"),    ],    "flowering_crops": [        ("pollinated_by", "Commercial Apiary"),        ("pollinated_by", "Almond Pollination Service"),        ("pollinated_by", "Bumblebee Farming Operation"),        ("pollinated_by", "Berry Farm Beekeeping"),        ("pollinated_by", "Orchard Bee Rental Service"),        ("pollinated_by", "Squash Pollination Specialist"),        ("pollinated_by", "Avocado Orchard Pollinator"),        ("pollinated_by", "Greenhouse Pollination Service"),        ("pollinated_by", "Organic Honey Producer"),        ("pollinated_by", "Native Pollinator Habitat"),    ],    "raw_agricultural_products": [        ("processed_by", "Tomato Canning Factory"),        ("processed_by", "Sugar Processing Plant"),        ("processed_by", "Frozen Vegetable Facility"),        ("processed_by", "Nut Processing Facility"),        ("processed_by", "Coffee Bean Processing Station"),        ("processed_by", "Fruit Juice Extraction Plant"),        ("processed_by", "Cocoa Processing Facility"),        ("processed_by", "Potato Chip Factory"),        ("processed_by", "Rice Processing Plant"),        ("processed_by", "Tea Processing Facility"),    ],    "grains": [        ("milled_by", "Stone Ground Flour Mill"),        ("milled_by", "Artisanal Corn Mill"),        ("milled_by", "Rice Milling Operation"),        ("milled_by", "Quinoa Processing Facility"),        ("milled_by", "Oat Rolling Mill"),        ("milled_by", "Ancient Grain Processing Facility"),        ("milled_by", "Buckwheat Mill"),        ("milled_by", "Industrial Wheat Processor"),        ("milled_by", "Small-batch Rye Mill"),        ("milled_by", "Barley Malting Facility"),    ],    "press_products": [        ("pressed_by", "Olive Oil Mill"),        ("pressed_by", "Cold-pressed Juice Facility"),        ("pressed_by", "Sesame Oil Producer"),        ("pressed_by", "Avocado Oil Extractor"),        ("pressed_by", "Grape Must Processor"),        ("pressed_by", "Apple Cider Press"),        ("pressed_by", "Coconut Oil Production Facility"),        ("pressed_by", "Walnut Oil Press"),        ("pressed_by", "Sunflower Seed Oil Facility"),        ("pressed_by", "Canola Oil Processing Plant"),    ],    "fermented_foods": [        ("fermented_by", "Kombucha Brewery"),        ("fermented_by", "Kimchi Producer"),        ("fermented_by", "Sauerkraut Facility"),        ("fermented_by", "Yogurt Production Plant"),        ("fermented_by", "Miso Factory"),        ("fermented_by", "Sourdough Bakery"),        ("fermented_by", "Tempeh Producer"),        ("fermented_by", "Natural Wine Maker"),        ("fermented_by", "Traditional Pickle Factory"),        ("fermented_by", "Natto Production Facility"),    ],    "spirits": [        ("distilled_by", "Craft Whiskey Distillery"),        ("distilled_by", "Vodka Production Facility"),        ("distilled_by", "Tequila Distillery"),        ("distilled_by", "Rum Production Plant"),        ("distilled_by", "Gin Distiller"),        ("distilled_by", "Bourbon House"),        ("distilled_by", "Brandy Producer"),        ("distilled_by", "Mezcal Distillery"),        ("distilled_by", "Moonshine Operation"),        ("distilled_by", "Craft Liqueur Producer"),    ],    "brewed_beverages": [        ("brewed_by", "Craft Beer Microbrewery"),        ("brewed_by", "Specialty Tea House"),        ("brewed_by", "Cold Brew Coffee Facility"),        ("brewed_by", "Hard Cider Producer"),        ("brewed_by", "Kombucha Brewery"),        ("brewed_by", "Sake Production Facility"),        ("brewed_by", "Large-scale Beer Factory"),        ("brewed_by", "Herbal Tea Blender"),        ("brewed_by", "Root Beer Maker"),        ("brewed_by", "Ginger Beer Producer"),    ],    "roasted_products": [        ("roasted_by", "Specialty Coffee Roastery"),        ("roasted_by", "Cacao Bean Roasting Facility"),        ("roasted_by", "Nut Roasting Plant"),        ("roasted_by", "Coffee Bean Processing Facility"),        ("roasted_by", "Artisanal Peanut Roaster"),        ("roasted_by", "Small-batch Almond Roaster"),        ("roasted_by", "Commercial Roasting House"),        ("roasted_by", "Single-origin Coffee Roaster"),        ("roasted_by", "Chicory Root Processor"),        ("roasted_by", "Grain Roasting Facility"),    ],    "ground_products": [        ("ground_by", "Spice Grinding Facility"),        ("ground_by", "Coffee Processing Plant"),        ("ground_by", "Flour Milling Operation"),        ("ground_by", "Indian Masala Mill"),        ("ground_by", "Cinnamon Processing Facility"),        ("ground_by", "Pepper Grinding Plant"),        ("ground_by", "Cocoa Processing Factory"),        ("ground_by", "Nut Butter Production Facility"),        ("ground_by", "Curry Powder Producer"),        ("ground_by", "Artisanal Stone Grinder"),    ],    "baked_goods": [        ("baked_by", "Artisan Sourdough Bakery"),        ("baked_by", "Commercial Bread Factory"),        ("baked_by", "Pastry Shop"),        ("baked_by", "Cookie Manufacturing Plant"),        ("baked_by", "Gluten-free Bakehouse"),        ("baked_by", "Bagel Shop"),        ("baked_by", "Croissant Bakery"),        ("baked_by", "Pie Production Facility"),        ("baked_by", "Cake Decorating Studio"),        ("baked_by", "Cracker Manufacturing Facility"),    ],    "dairy_products": [        ("churned_by", "Small-batch Ice Cream Maker"),        ("churned_by", "Artisanal Butter Producer"),        ("churned_by", "Gelato Manufacturing Facility"),        ("churned_by", "Cultured Butter Creamery"),        ("churned_by", "Frozen Yogurt Plant"),        ("churned_by", "Organic Dairy Processor"),        ("churned_by", "Amish Butter Maker"),        ("churned_by", "Grass-fed Dairy Operation"),        ("churned_by", "Non-dairy Ice Cream Facility"),        ("churned_by", "Buffalo Milk Processor"),    ],    "meat_animals": [        ("slaughtered_by", "Small-scale Abattoir"),        ("slaughtered_by", "USDA-certified Slaughterhouse"),        ("slaughtered_by", "Mobile Slaughter Unit"),        ("slaughtered_by", "Halal Processing Facility"),        ("slaughtered_by", "Kosher Slaughterhouse"),        ("slaughtered_by", "Poultry Processing Plant"),        ("slaughtered_by", "Lamb Processing Facility"),        ("slaughtered_by", "Beef Processing Plant"),        ("slaughtered_by", "Family-owned Slaughter Facility"),        ("slaughtered_by", "Organic Meat Processor"),    ],    "meat_products": [        ("butchered_by", "Whole-animal Butcher Shop"),        ("butchered_by", "Artisanal Meat Cutter"),        ("butchered_by", "Game Processing Facility"),        ("butchered_by", "Specialty Cut Meat Shop"),        ("butchered_by", "Charcuterie Producer"),        ("butchered_by", "Sustainable Meat Processor"),        ("butchered_by", "Custom Cutting Service"),        ("butchered_by", "Ethnic Butcher Shop"),        ("butchered_by", "Grass-fed Meat Processor"),        ("butchered_by", "Nose-to-tail Butchery"),    ],    "smoked_products": [        ("smoked_by", "Artisanal Bacon Producer"),        ("smoked_by", "Smoked Fish House"),        ("smoked_by", "BBQ Smokehouse"),        ("smoked_by", "Smoked Cheese Facility"),        ("smoked_by", "Specialty Ham Producer"),        ("smoked_by", "Salmon Smoking Operation"),        ("smoked_by", "German Smokehouse"),        ("smoked_by", "Jerky Manufacturing Plant"),        ("smoked_by", "Artisanal Sausage Maker"),        ("smoked_by", "Cold Smoking Facility"),    ],    "dried_foods": [        ("dried_by", "Fruit Dehydration Facility"),        ("dried_by", "Beef Jerky Producer"),        ("dried_by", "Sun-dried Tomato Farm"),        ("dried_by", "Herb Drying Facility"),        ("dried_by", "Mushroom Dehydration Plant"),        ("dried_by", "Dried Bean Processor"),        ("dried_by", "Freeze-drying Operation"),        ("dried_by", "Spice Drying Facility"),        ("dried_by", "Apple Chip Producer"),        ("dried_by", "Raisin Processing Plant"),    ],    "cured_products": [        ("cured_by", "Prosciutto Production Facility"),        ("cured_by", "Artisanal Salami Maker"),        ("cured_by", "Spanish Ham Producer"),        ("cured_by", "Specialty Bacon Curer"),        ("cured_by", "Traditional Sausage House"),        ("cured_by", "Gravlax Producer"),        ("cured_by", "Italian Cured Meat Facility"),        ("cured_by", "Pancetta Curing House"),        ("cured_by", "Salt Cod Processing Facility"),        ("cured_by", "Beef Jerky Production Plant"),    ],    "food_products": [        ("inspected_by", "USDA Inspector"),        ("inspected_by", "FDA Compliance Officer"),        ("inspected_by", "State Health Department"),        ("inspected_by", "Third-party Food Safety Auditor"),        ("inspected_by", "Meat Inspection Service"),        ("inspected_by", "Seafood Safety Inspector"),        ("inspected_by", "Dairy Farm Inspector"),        ("inspected_by", "Import Quality Control Office"),        ("inspected_by", "Restaurant Health Inspector"),        ("inspected_by", "Manufacturing Plant Inspector"),    ],    "specialty_foods": [        ("certified_by", "Organic Certification Body"),        ("certified_by", "Kosher Certification Agency"),        ("certified_by", "Halal Certification Authority"),        ("certified_by", "Fair Trade Certifier"),        ("certified_by", "Non-GMO Project Verifier"),        ("certified_by", "Gluten-Free Certification Organization"),        ("certified_by", "Demeter Biodynamic Certifier"),        ("certified_by", "Rainforest Alliance"),        ("certified_by", "Marine Stewardship Council"),        ("certified_by", "Animal Welfare Approved Program"),    ],    "graded_products": [        ("graded_by", "USDA Egg Grading Service"),        ("graded_by", "Beef Carcass Grader"),        ("graded_by", "Coffee Quality Institute"),        ("graded_by", "Wheat Quality Laboratory"),        ("graded_by", "Dairy Products Evaluation Service"),        ("graded_by", "Apple Grading Facility"),        ("graded_by", "Olive Oil Tasting Panel"),        ("graded_by", "Rice Classification Center"),        ("graded_by", "Cheese Grading Authority"),        ("graded_by", "Maple Syrup Grading Station"),    ],    "food_safety": [        ("tested_by", "Pathogen Testing Laboratory"),        ("tested_by", "Pesticide Residue Screening Facility"),        ("tested_by", "Heavy Metal Testing Lab"),        ("tested_by", "Food Allergen Testing Service"),        ("tested_by", "Shelf-life Testing Facility"),        ("tested_by", "Water Quality Laboratory"),        ("tested_by", "Microbial Analysis Center"),        ("tested_by", "GMO Testing Facility"),        ("tested_by", "Seafood Contamination Lab"),        ("tested_by", "Dairy Product Testing Service"),    ],    "nutritional_analysis": [        ("analyzed_by", "Food Nutrition Laboratory"),        ("analyzed_by", "Supplement Testing Facility"),        ("analyzed_by", "Macronutrient Analysis Service"),        ("analyzed_by", "Vitamin Content Laboratory"),        ("analyzed_by", "Mineral Testing Facility"),        ("analyzed_by", "Food Composition Database"),        ("analyzed_by", "Caloric Value Determination Lab"),        ("analyzed_by", "Functional Ingredient Analyzer"),        ("analyzed_by", "Bioactive Compound Testing Service"),        ("analyzed_by", "University Food Science Department"),    ],    "foods": [        ("packaged_by", "Aseptic Packaging Facility"),        ("packaged_by", "Vacuum Sealing Operation"),        ("packaged_by", "Canning Factory"),        ("packaged_by", "Modified Atmosphere Packaging Plant"),        ("packaged_by", "Bottling Facility"),        ("packaged_by", "Frozen Food Packaging Line"),        ("packaged_by", "Bag-in-Box Packaging Operation"),        ("packaged_by", "Single-serving Packaging Plant"),        ("packaged_by", "Bulk Food Packaging Facility"),        ("packaged_by", "Sustainable Packaging Service"),    ],    "consumer_products": [        ("labeled_by", "Nutrition Facts Labeling Service"),        ("labeled_by", "Allergen Labeling Facility"),        ("labeled_by", "Country of Origin Labeling Center"),        ("labeled_by", "Ingredient Listing Service"),        ("labeled_by", "Barcode Application Facility"),        ("labeled_by", "Organic Label Verification Service"),        ("labeled_by", "Product Dating Facility"),        ("labeled_by", "QR Code Application Service"),        ("labeled_by", "Multi-language Labeling Operation"),        ("labeled_by", "Sustainable Packaging Certification"),    ],    "preserved_products": [        ("sealed_by", "Vacuum Sealing Facility"),        ("sealed_by", "Heat Sealing Operation"),        ("sealed_by", "Canning Factory"),        ("sealed_by", "Tamper-evident Packaging Plant"),        ("sealed_by", "Modified Atmosphere Sealer"),        ("sealed_by", "Bottling Line"),        ("sealed_by", "Jar Sealing Operation"),        ("sealed_by", "Aseptic Processing Plant"),        ("sealed_by", "Retort Packaging Facility"),        ("sealed_by", "Induction Sealing Service"),    ],    "food_logistics": [        ("transported_by", "Refrigerated Trucking Company"),        ("transported_by", "Container Ship Operator"),        ("transported_by", "Air Freight Service"),        ("transported_by", "Rail Transportation Service"),        ("transported_by", "Last-mile Delivery Fleet"),        ("transported_by", "Fresh Produce Logistics Provider"),        ("transported_by", "Temperature-controlled Carrier"),        ("transported_by", "Frozen Food Transport Specialist"),        ("transported_by", "Local Delivery Service"),        ("transported_by", "International Food Freight Company"),    ],    "inventory_management": [        ("stored_by", "Dry Goods Warehouse"),        ("stored_by", "Cold Storage Facility"),        ("stored_by", "Grain Silo Operation"),        ("stored_by", "Controlled Atmosphere Storage"),        ("stored_by", "Wine Cellar Facility"),        ("stored_by", "Bulk Ingredient Storage Facility"),        ("stored_by", "Freezer Warehouse"),        ("stored_by", "Distribution Center"),        ("stored_by", "Cross-docking Facility"),        ("stored_by", "On-demand Inventory Management Service"),    ],    "temperature_sensitive_foods": [        ("refrigerated_by", "Commercial Cold Storage"),        ("refrigerated_by", "Blast Chilling Facility"),        ("refrigerated_by", "Flash Freezing Operation"),        ("refrigerated_by", "Cold Chain Logistics Provider"),        ("refrigerated_by", "Temperature-controlled Warehouse"),        ("refrigerated_by", "Dairy Cold Storage"),        ("refrigerated_by", "Seafood Refrigeration Facility"),        ("refrigerated_by", "Produce Cooling Operation"),        ("refrigerated_by", "Meat Refrigeration Plant"),        ("refrigerated_by", "Vaccine Cold Storage Provider"),    ],    "international_foods": [        ("imported_by", "Specialty Coffee Importer"),        ("imported_by", "European Cheese Broker"),        ("imported_by", "Exotic Fruit Importer"),        ("imported_by", "Olive Oil Import Company"),        ("imported_by", "Asian Food Specialist"),        ("imported_by", "Spice Trading Company"),        ("imported_by", "Wine Import Business"),        ("imported_by", "Seafood Import Service"),        ("imported_by", "Italian Food Products Importer"),        ("imported_by", "Ethnic Food Distribution Company"),    ],    "export_products": [        ("exported_by", "California Almond Cooperative"),        ("exported_by", "Midwest Grain Export Terminal"),        ("exported_by", "Florida Citrus Export Association"),        ("exported_by", "Pacific Northwest Seafood Exporters"),        ("exported_by", "Wine Export Consortium"),        ("exported_by", "Organic Produce Export Company"),        ("exported_by", "Meat Export Federation"),        ("exported_by", "Dairy Export Council"),        ("exported_by", "Specialty Food Export Service"),        ("exported_by", "Agricultural Products Trading Company"),    ],    "supply_chain": [        ("distributed_by", "Regional Food Hub"),        ("distributed_by", "National Grocery Distributor"),        ("distributed_by", "Specialty Food Distributor"),        ("distributed_by", "Restaurant Supply Company"),        ("distributed_by", "Farm-to-Table Distribution Service"),        ("distributed_by", "Institutional Food Service Provider"),        ("distributed_by", "Ethnic Food Wholesaler"),        ("distributed_by", "Organic Food Distribution Network"),        ("distributed_by", "Last-mile Grocery Delivery Service"),        ("distributed_by", "Food Box Subscription Service"),    ],    "delivery_services": [        ("delivered_by", "Restaurant Delivery App"),        ("delivered_by", "Grocery Delivery Service"),        ("delivered_by", "Meal Kit Delivery Company"),        ("delivered_by", "Direct Farm Delivery Service"),        ("delivered_by", "Prepared Meal Delivery Business"),        ("delivered_by", "Specialty Food Courier"),        ("delivered_by", "Office Catering Delivery Service"),        ("delivered_by", "Milk Delivery Service"),        ("delivered_by", "CSA Box Delivery Program"),        ("delivered_by", "Food Bank Distribution Network"),    ],    "retail_channels": [        ("sold_by", "Farmers Market Vendor"),        ("sold_by", "Neighborhood Grocery Store"),        ("sold_by", "National Supermarket Chain"),        ("sold_by", "Online Food Marketplace"),        ("sold_by", "Specialty Food Shop"),        ("sold_by", "Food Hall Vendor"),        ("sold_by", "Corner Bodega"),        ("sold_by", "International Food Market"),        ("sold_by", "Food Cooperative"),        ("sold_by", "Subscription Box Service"),    ],    "brand_marketing": [        ("marketed_by", "Food Marketing Agency"),        ("marketed_by", "Brand Development Firm"),        ("marketed_by", "Social Media Influencer"),        ("marketed_by", "Food Industry Association"),        ("marketed_by", "Agricultural Marketing Board"),        ("marketed_by", "Celebrity Chef Endorsement"),        ("marketed_by", "Public Relations Firm"),        ("marketed_by", "Digital Marketing Service"),        ("marketed_by", "Food Tourism Board"),        ("marketed_by", "Trade Show Organization"),    ],    "consumer_sales": [        ("retailed_by", "Natural Foods Market"),        ("retailed_by", "Big Box Store"),        ("retailed_by", "Convenience Store Chain"),        ("retailed_by", "Ethnic Grocery Specialist"),        ("retailed_by", "Organic Supermarket"),        ("retailed_by", "Gourmet Food Shop"),        ("retailed_by", "Farmers Market Stand"),        ("retailed_by", "Airport Food Kiosk"),        ("retailed_by", "Gas Station Minimart"),        ("retailed_by", "Direct-to-Consumer Website"),    ],    "wholesale_distribution": [        ("wholesaled_by", "Restaurant Supply Company"),        ("wholesaled_by", "Wholesale Club Store"),        ("wholesaled_by", "Produce Terminal Market"),        ("wholesaled_by", "Institutional Food Provider"),        ("wholesaled_by", "Bulk Ingredient Supplier"),        ("wholesaled_by", "Food Service Distributor"),        ("wholesaled_by", "Ethnic Food Importer"),        ("wholesaled_by", "Seafood Wholesale Market"),        ("wholesaled_by", "Specialty Food Broker"),        ("wholesaled_by", "Bakery Ingredient Wholesaler"),    ],    "prepared_foods": [        ("prepared_by", "Fast Casual Restaurant"),        ("prepared_by", "Gourmet Food Truck"),        ("prepared_by", "Hospital Kitchen"),        ("prepared_by", "School Lunch Program"),        ("prepared_by", "Hotel Banquet Service"),        ("prepared_by", "Meal Kit Assembly Facility"),        ("prepared_by", "Corporate Cafeteria"),        ("prepared_by", "Retirement Home Kitchen"),        ("prepared_by", "Airline Catering Service"),        ("prepared_by", "Stadium Concession Stand"),    ],    "food_service": [        ("served_by", "Full-service Restaurant"),        ("served_by", "Quick Service Restaurant"),        ("served_by", "Coffee Shop"),        ("served_by", "Food Court Vendor"),        ("served_by", "School Cafeteria"),        ("served_by", "Hospital Food Service"),        ("served_by", "Cruise Ship Dining Room"),        ("served_by", "Stadium Concession"),        ("served_by", "Airline Meal Service"),        ("served_by", "Hotel Room Service"),    ],    "catering_services": [        ("catered_by", "Corporate Event Caterer"),        ("catered_by", "Wedding Catering Company"),        ("catered_by", "Boxed Lunch Provider"),        ("catered_by", "Food Truck Catering"),        ("catered_by", "High-end Private Chef"),        ("catered_by", "Hospital Food Service Contractor"),        ("catered_by", "University Dining Services"),        ("catered_by", "Film Set Catering Company"),        ("catered_by", "Concert Venue Food Service"),        ("catered_by", "In-flight Meal Provider"),    ],    "consumption_patterns": [        ("consumed_by", "School Lunch Program"),        ("consumed_by", "Hospital Patient Service"),        ("consumed_by", "Airline Passenger"),        ("consumed_by", "Hotel Guest"),        ("consumed_by", "Restaurant Patron"),        ("consumed_by", "Urban Family Household"),        ("consumed_by", "College Student"),        ("consumed_by", "Food Bank Recipient"),        ("consumed_by", "Office Worker"),        ("consumed_by", "Sports Team"),    ],    "cultural_foods": [        ("is_traditional_to", "Italian Regional Cuisine"),        ("is_traditional_to", "Japanese Festival"),        ("is_traditional_to", "Mexican Holiday Celebration"),        ("is_traditional_to", "Indian Wedding Feast"),        ("is_traditional_to", "Jewish Religious Observance"),        ("is_traditional_to", "Chinese New Year"),        ("is_traditional_to", "Southern American Barbecue"),        ("is_traditional_to", "French Provincial Cooking"),        ("is_traditional_to", "Greek Island Diet"),        ("is_traditional_to", "Indigenous Harvest Ceremony"),    ],    "dietary_importance": [        ("is_staple_of", "Mediterranean Diet"),        ("is_staple_of", "Japanese Rice-based Cuisine"),        ("is_staple_of", "Latin American Bean Preparations"),        ("is_staple_of", "Northern European Rye Tradition"),        ("is_staple_of", "Southeast Asian Rice Economy"),        ("is_staple_of", "Middle Eastern Wheat Culture"),        ("is_staple_of", "African Cassava-based Diet"),        ("is_staple_of", "South American Potato Cuisine"),        ("is_staple_of", "Indian Lentil Preparation"),        ("is_staple_of", "Pacific Islander Taro Culture"),    ],    "geographic_origin": [        ("is_originated_from", "Champagne Region"),        ("is_originated_from", "Kobe Cattle District"),        ("is_originated_from", "Colombian Coffee Triangle"),        ("is_originated_from", "Bordeaux Wine Country"),        ("is_originated_from", "Vermont Maple Forest"),        ("is_originated_from", "Parmigiano-Reggiano Province"),        ("is_originated_from", "Sichuan Pepper Growing Region"),        ("is_originated_from", "Maine Lobster Coast"),        ("is_originated_from", "Ethiopian Coffee Forest"),        ("is_originated_from", "Italian Truffle Territory"),    ],    "recipe_components": [        ("is_ingredient_in", "Artisanal Bread Recipe"),        ("is_ingredient_in", "Thai Curry Paste"),        ("is_ingredient_in", "Craft Beer Formulation"),        ("is_ingredient_in", "Italian Pasta Sauce"),        ("is_ingredient_in", "Commercial Cake Mix"),        ("is_ingredient_in", "Protein Bar Formulation"),        ("is_ingredient_in", "Plant-based Meat Alternative"),        ("is_ingredient_in", "Traditional Pickle Recipe"),        ("is_ingredient_in", "Baby Food Formulation"),        ("is_ingredient_in", "Energy Drink Composition"),    ],    "alternative_ingredients": [        ("is_substitute_for", "Egg Replacement Product"),        ("is_substitute_for", "Dairy-free Milk Alternative"),        ("is_substitute_for", "Sugar-free Sweetener"),        ("is_substitute_for", "Gluten-free Flour Blend"),        ("is_substitute_for", "Plant-based Meat Analog"),        ("is_substitute_for", "Low-sodium Salt Alternative"),        ("is_substitute_for", "Butter Replacement Product"),        ("is_substitute_for", "Caffeine-free Coffee Alternative"),        ("is_substitute_for", "Alcohol-free Beer Substitute"),        ("is_substitute_for", "Nut-free Seed Butter"),    ],    "preservation_methods": [        ("is_preserved_by", "Traditional Salt Curing"),        ("is_preserved_by", "Sugar Crystallization Process"),        ("is_preserved_by", "Vinegar Pickling Method"),        ("is_preserved_by", "Smoking Chamber"),        ("is_preserved_by", "Freeze-drying Technology"),        ("is_preserved_by", "Canning Process"),        ("is_preserved_by", "Fermentation Culture"),        ("is_preserved_by", "Vacuum Sealing System"),        ("is_preserved_by", "Alcohol Preservation Method"),        ("is_preserved_by", "Cold Temperature Storage"),    ],}# Validate template relationsfor _stage, _pairs in TEMPLATE_BY_STAGE.items():    for _rel, _ in _pairs:        assert _rel in FIXED_RELS, f"Template uses non-allowed relation '{_rel}' in stage '{_stage}'"# ------------- utilities -------------def retry(max_tries=3, base_delay=0.6):    def deco(fn):        @wraps(fn)        def wrapper(*args, **kwargs):            tries = 0            while True:                try:                    return fn(*args, **kwargs)                except Exception as e:                    tries += 1                    logger.warning("Retry %s/%s in %s: %s", tries, max_tries, fn.__name__, e)                    if tries >= max_tries:                        raise                    time.sleep(base_delay * (2 ** (tries - 1)))        return wrapper    return decodef _strip_code_fences(s: str) -> str:    if not s:        return s    s = s.strip()    if s.startswith("```"):        s = re.sub(r"^```(?:json|cypher)?\s*|\s*```$", "", s, flags=re.IGNORECASE | re.DOTALL)    return s.strip()def json_relaxed_load(s: str):    s = _strip_code_fences(s)    try:        return json.loads(s)    except Exception:        m = re.search(r"(\{.*\}|\[.*\])", s, flags=re.DOTALL)        if m:            return json.loads(m.group(1))        raisedef batched(seq, n):    for i in range(0, len(seq), n):        yield seq[i:i+n]# ------------- OpenAI client -------------def get_openai_client():    if not OPENAI_API_KEY:        return None    try:        from openai import OpenAI        return OpenAI(api_key=OPENAI_API_KEY)    except Exception as e:        logger.info("OpenAI client unavailable: %s", e)        return Nonedef llm_available() -> bool:    return get_openai_client() is not None# ------------- state -------------@dataclassclass State:    items: List[str] = field(default_factory=list)    item_stage: Dict[str, str] = field(default_factory=dict)    ethnic_market: Dict[str, str] = field(default_factory=dict)   # item -> "Indian Grocery" / ...    import_origin: Dict[str, str] = field(default_factory=dict)   # item -> "India" / "Domestic (USA)" / region    us_cert_authority: Dict[str, str] = field(default_factory=dict)  # item -> "USDA Organic" / "FDA" / ...    triples: List[List[str]] = field(default_factory=list)    diagnostics: Dict[str, Any] = field(default_factory=dict)# ------------- Neo4j -------------def fetch_items_via_cypher(limit: int) -> List[str]:    # v5 try, then fallback    q_v5 = """        MATCH (n)        WHERE toUpper(n.name) CONTAINS 'FOODON'        AND n.out_degree = 1        RETURN n.name_text AS item        LIMIT $limit        """    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))    try:        with driver.session() as s:            try:                rows = s.run(q_v5, limit=limit)                data = [r["item"] for r in rows if r["item"]]                if data:                    return data            except CypherSyntaxError:                pass    finally:        driver.close()    return []# ------------- Heuristics (fallbacks) -------------def heuristic_stage_one(item: str) -> str:    it = (item or "").lower().strip()    prepared_cues = [        "fried","baked","grilled","roasted","stir-fry","sauteed","cooked",        "boiled","braised","broth","soup","stew","salad","curry","tacos",        "burrito","sandwich","wrap","pizza","pasta","burger","omelette",        "noodle","rice bowl","ramen","dumpling","casserole","stewed",        "sautéed","sauté","fried rice","stir fry","biryani","enchilada",        "samosa","kebab","roll","cooked meal","entrée","prepared dish"    ]    if any(w in it for w in prepared_cues):        return "prepared_dish"    raw_cues = [        "raw","fresh","paddy","grain","leaf","seed","fruit","vegetable",        "bean","lentil","legume","tuber","root","nut","herb","spice",        "flower","mushroom","shoot","sprout","stem","whole","green",        "unpolished","unprocessed","uncooked","farm","produce"    ]    if any(w in it for w in raw_cues):        return "raw_commodity"    processed_cues = [        "powder","paste","sauce","oil","flour","noodles","snack","chips",        "frozen","instant","canned","jar","pickled","dried","dehydrated",        "fermented","sweetened","salted","syrup","extract","essence",        "concentrate","mix","blend","spread","butter","jam","preserve",        "marinated","ready to eat","packaged","processed"    ]    if any(w in it for w in processed_cues):        return "processed_product"    return "processed_product"def heuristic_stage(items: List[str]) -> Dict[str, str]:    return {it: heuristic_stage_one(it) for it in items}ETHNIC_CUES = [    ("Indian Grocery", [        "basmati","poha","idli","dosa","ghee","masala","turmeric",        "urad dal","chana dal","moong dal","hing","paneer","atta",        "besan","tamarind","curry leaves","mustard seeds","cumin",        "fennel","cardamom","clove","fenugreek","sambar powder",        "biryani masala","kashmiri chili","garam masala","jaggery",        "any product of Indian or South Asian origin"    ]),    ("Pakistani Grocery", ["nihari masala","shan masala","haleem","achar","seviyan"]),    ("Bangladeshi Grocery", ["ilish","mustard oil","pitha","shutki"]),    ("Nepali / Bhutanese Grocery", ["momo","thukpa","sel roti","gundruk"]),    ("Mexican Grocery", ["masa","maseca","jalapeño","chipotle","tortilla","epazote"]),    ("East Asian Grocery", ["nori","miso","kimchi","udon","matcha","gochujang","ramen"]),    ("Chinese Grocery", ["doubanjiang","shaoxing","sichuan pepper","hoisin"]),    ("Japanese Grocery", ["katsuobushi","kombu","mirin","dashi","panko","sake"]),    ("Korean Grocery", ["gochugaru","doenjang","kimchi","tteokbokki"]),    ("Southeast Asian Grocery", ["lemongrass","galangal","laksa","belacan","pho","fish sauce"]),    ("Thai Grocery", ["green curry","red curry","palm sugar"]),    ("Vietnamese Grocery", ["pho noodles","nuoc mam","rice paper"]),    ("Indonesian Grocery", ["tempeh","sambal","rendang"]),    ("Filipino Grocery", ["adobo","pandesal","ube","bagoong"]),    ("Middle Eastern Grocery", ["tahini","sumac","za'atar","bulgur","labneh"]),    ("Mediterranean Grocery", ["olive oil","feta","halloumi","olives"]),    ("African Grocery", ["injera","berbere","teff","fufu","egusi"]),    ("Italian Grocery", ["pasta","olive oil","parmesan","risotto"]),    ("French Grocery", ["baguette","brie","herbes de provence","dijon"]),    ("Eastern European Grocery", ["borscht","sauerkraut","pierogi","kielbasa"]),    # U.S. regional    ("American Southern Grocery", ["grits","cajun"]),    ("Cajun / Creole Grocery", ["gumbo base","jambalaya mix","beignet"]),    ("Tex-Mex Grocery", ["queso","enchilada","fajita"]),    ("Hawaiian Grocery", ["spam","poke"]),    ("New England Grocery", ["clam chowder","cranberry"]),    ("California Grocery", ["avocado","sourdough","kombucha"]),    ("General American Grocery", [])]COUNTRY_CUES = [    ("India", ["basmati","idli","dosa","poha","turmeric","hing","toor dal","ghee","paneer","biryani","tamarind"]),    ("China", ["doubanjiang","sichuan","hoisin","soy sauce","bok choy"]),    ("Japan", ["nori","matcha","katsuobushi","mirin","ramen","miso","wasabi"]),    ("Korea", ["kimchi","gochujang","doenjang","bibimbap","soju"]),    ("Thailand", ["galangal","lemongrass","kaffir lime","fish sauce","green curry"]),    ("Vietnam", ["pho","nuoc mam","rice paper","bun cha"]),    ("Mexico", ["masa","jalapeño","chipotle","tomatillo","achiote"]),    ("Italy", ["pasta","risotto","pesto","mozzarella","parmesan"]),    ("France", ["baguette","brie","camembert","crème fraîche","truffle"]),    ("Greece", ["feta","kalamata","tzatziki","dolma"]),    ("Ethiopia", ["injera","berbere","teff"]),    ("United States (General)", ["burger","barbecue","mac and cheese","hot dog","apple pie"]),]def heuristic_ethnic(item: str) -> str:    it = (item or "").lower()    for label, keys in ETHNIC_CUES:        if any(k in it for k in keys):            return label    return "General American Grocery"def _strip_diacritics(s: str) -> str:    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))def _normalize(s: str) -> str:    return _strip_diacritics((s or "").lower().strip())def _token_to_pattern(tok: str) -> re.Pattern:    t = _normalize(tok)    t = re.escape(t).replace(r"\ ", r"\s+")    opt_plural = r"(?:s)?" if re.search(r"[a-z]$", t) else ""    return re.compile(rf"\b{t}{opt_plural}\b", flags=re.IGNORECASE)def _compile_table(cues: List[Tuple[str, List[str]]]):    return [(label, [_token_to_pattern(k) for k in keys]) for label, keys in cues]def _any_match(text_norm: str, pats: List[re.Pattern]) -> bool:    return any(p.search(text_norm) for p in pats)_US_PRIORITY = {    "united states (general)",    "southern united states",    "cajun / creole",    "tex-mex",    "new england",    "midwest",    "pacific northwest",    "southwest",    "hawaiian",    "appalachian",    "california",    "new york",    "chicago",    "louisiana",    "texas",    "florida",    "alaska",}_FALLBACK_BUCKETS = [    ("Imported (Likely East Asia)", ["miso","kombu","nori","ramen","dashi","gochujang","doenjang","kimchi","mirin","tamari"]),    ("Imported (Likely South/Southeast Asia)", ["tamarind","garam masala","hing","jaggery","lemongrass","galangal","laksa","belacan","fish sauce"]),    ("Imported (Likely Latin America)", ["achiote","epazote","tomatillo","masa","guajillo","ancho","aji amarillo"]),    ("Imported (Likely Middle East/Mediterranean)", ["tahini","za'atar","labneh","bulgur","sumac","harissa"]),    ("Imported (Likely Africa)", ["berbere","teff","injera","egusi","fufu","jollof"]),    ("Imported (Likely Europe)", ["parmesan","mozzarella","prosciutto","manchego","brie","camembert"]),]@lru_cache(maxsize=1)def _compiled_country():    return _compile_table(tuple(COUNTRY_CUES))@lru_cache(maxsize=1)def _compiled_ethnic():    return _compile_table(tuple(ETHNIC_CUES))@lru_cache(maxsize=1)def _compiled_fallback():    return _compile_table(tuple(_FALLBACK_BUCKETS))def heuristic_origin(item: str) -> str:    it = _normalize(item)    # 1) Country-level matches    for country, pats in _compiled_country():        if _any_match(it, pats):            return country    # 2) Ethnic categories (as coarse origin hints)    for label, pats in _compiled_ethnic():        if _any_match(it, pats):            return label    # 3) Fallback buckets    for label, pats in _compiled_fallback():        if _any_match(it, pats):            return label    # 4) Default    return "Domestic (USA)"def heuristic_us_cert(item: str, stage: str) -> str:    it = (item or "").lower()    if stage == "prepared_dish":        return "Local Health Department"    if "organic" in it:        return "USDA Organic"    if any(k in it for k in ["meat","poultry","egg product"]) or "raw milk" in it:        return "USDA FSIS"    if stage == "raw_commodity":        return "USDA/APHIS"    return "FDA"# ------------- LLM calls (classification) -------------def get_stage_default(it: str) -> str:    return "raw_agricultural_products"@retry(max_tries=3, base_delay=0.5)def classify_stage_via_llm(items: List[str]) -> Dict[str, str]:    client = get_openai_client()    if client is None or not items:        logger.info("LLM unavailable; using stage heuristics.")        return heuristic_stage(items)    # 🔧 New: tell the LLM to choose from your template keys    allowed_stages = sorted(TEMPLATE_BY_STAGE.keys())    sys = (        "Classify each food term into exactly one of the following buckets:\n"        + ", ".join(allowed_stages) +        ". Return ONLY a JSON object mapping item->bucket."    )    out: Dict[str,str] = {}    for chunk in batched(items, 100):        user = "Return ONLY a JSON object mapping item->bucket (one of the allowed buckets). Items:\n" + json.dumps(chunk, ensure_ascii=False)        resp = client.chat.completions.create(            model=OPENAI_MODEL,            temperature=0.0,            messages=[{"role":"system","content":sys},{"role":"user","content":user}]        )        obj = json_relaxed_load(resp.choices[0].message.content.strip())        if not isinstance(obj, dict):            obj = {}        for k in chunk:            v = str(obj.get(k, "")).strip()            # If LLM gives something invalid, fall back to a sane default bucket:            out[k] = v if v in TEMPLATE_BY_STAGE else "raw_agricultural_products"    return out@retry(max_tries=3, base_delay=0.5)def infer_ethnic_market_via_llm(items: List[str]) -> Dict[str, str]:    client = get_openai_client()    if client is None or not items:        logger.info("LLM unavailable; using ethnic heuristics.")        return {it: heuristic_ethnic(it) for it in items}    sys = (        "For each food name, assign the most likely U.S. retail ethnic market segment. "        "Choose from a concise set such as: 'Indian Grocery', 'Mexican Grocery', 'East Asian Grocery', "        "'Southeast Asian Grocery', 'Middle Eastern Grocery', 'General American Grocery'."    )    out: Dict[str,str] = {}    for chunk in batched(items, 100):        user = "Return ONLY a JSON object mapping item->ethnic_segment. Items:\n" + json.dumps(chunk, ensure_ascii=False)        resp = client.chat.completions.create(            model=OPENAI_MODEL,            temperature=0.0,            messages=[{"role":"system","content":sys},{"role":"user","content":user}]        )        obj = json_relaxed_load(resp.choices[0].message.content.strip())        if not isinstance(obj, dict):            obj = {}        for k in chunk:            out[k] = (str(obj.get(k, "")).strip() or heuristic_ethnic(k))    return out@retry(max_tries=3, base_delay=0.5)def infer_import_origin_via_llm(items: List[str]) -> Dict[str, str]:    client = get_openai_client()    if client is None or not items:        logger.info("LLM unavailable; using origin heuristics.")        return {it: heuristic_origin(it) for it in items}    sys = (        "For each food item, estimate the most likely country or region of origin when sold in the U.S. retail market. "        "If domestically produced, return 'Domestic (USA)'. Otherwise a country ('India', 'Mexico') or region ('Middle East')."    )    out: Dict[str,str] = {}    for chunk in batched(items, 100):        user = "Return ONLY a JSON object mapping item->origin. Items:\n" + json.dumps(chunk, ensure_ascii=False)        resp = client.chat.completions.create(            model=OPENAI_MODEL,            temperature=0.0,            messages=[{"role":"system","content":sys},{"role":"user","content":user}]        )        obj = json_relaxed_load(resp.choices[0].message.content.strip())        if not isinstance(obj, dict):            obj = {}        for k in chunk:            out[k] = (str(obj.get(k, "")).strip() or heuristic_origin(k))    return out@retry(max_tries=3, base_delay=0.5)def infer_us_cert_authority_via_llm(items: List[str], stages: Dict[str, str]) -> Dict[str, str]:    client = get_openai_client()    if client is None or not items:        logger.info("LLM unavailable; using certification heuristics.")        return {it: heuristic_us_cert(it, stages.get(it, "processed_product")) for it in items}    sys = (        "For each item, output the most relevant U.S. certification or oversight authority at point-of-sale: "        "Examples: 'USDA Organic', 'USDA/APHIS', 'USDA FSIS', 'FDA', 'Local Health Department'. "        "Use 'Local Health Department' for prepared dishes at restaurants."    )    out: Dict[str,str] = {}    for chunk in batched(items, 75):        payload = [{"item": it, "stage": stages.get(it, "processed_product")} for it in chunk]        user = "Return ONLY a JSON object mapping item->authority. Inputs:\n" + json.dumps(payload, ensure_ascii=False)        resp = client.chat.completions.create(            model=OPENAI_MODEL,            temperature=0.0,            messages=[{"role":"system","content":sys},{"role":"user","content":user}]        )        obj = json_relaxed_load(resp.choices[0].message.content.strip())        if not isinstance(obj, dict):            obj = {}        for k in chunk:            v = str(obj.get(k, "")).strip()            out[k] = v or heuristic_us_cert(k, stages.get(k, "processed_product"))    return out# ------------- Heuristic plausibility gate -------------def is_relation_plausible(item: str, rel: str, org: str, stage: str) -> Tuple[bool, str]:    """Cheap rule-based filter before the LLM validator."""    txt = _normalize(item)    rel_l = rel.lower()    org_l = _normalize(org)    # Item categories    is_pickle_like = any(k in txt for k in ["pickle", "pickled", "achar", "kimchi"])    is_coffee_like = any(k in txt for k in ["coffee", "espresso", "arabica", "robusta"])    is_tea_like = any(k in txt for k in ["tea", "matcha"])    is_spice_like = any(k in txt for k in ["spice", "masala", "chili", "turmeric", "cumin", "cardamom", "clove", "pepper", "coriander"])    is_raw = (stage == "raw_commodity")    # Orgs that shouldn't process    non_processing_orgs = ["importer","distributor","wholesaler","supermarket","convenience","marketplace","restaurant","caterer","ghost kitchen","food truck"]    if rel_l in {"roasted_by","baked_by","brewed_by","fermented_by","confected_by","ground_by","pressed_by","aged_by","processed_by"}:        if any(k in org_l for k in non_processing_orgs):            return False, f"{org} is not a processing facility for '{rel}'."    # Pickles & ferments    if is_pickle_like and rel_l in {"baked_by","roasted_by"}:        return False, "Pickled/fermented items are not baked/roasted."    # Coffee rules    if is_coffee_like:        if rel_l in {"baked_by","fermented_by"}:            return False, "Coffee is roasted/ground, not baked or fermented at winery."        if rel_l in {"roasted_by","ground_by"} and not any(k in org_l for k in ["roast", "grind", "coffee"]):            return False, "Coffee should be roasted/ground by a roastery/grinder."    # Tea rules    if is_tea_like and rel_l in {"brewed_by","fermented_by"} and "kombucha" not in txt:        # tea leaves as product shouldn't be 'brewed_by' in supply chain sense        return False, "Tea as a retail product isn't 'brewed_by' in supply chain relations."    # Spices    if is_spice_like and rel_l in {"baked_by","brewed_by"}:        return False, "Spices are typically ground/processed, not baked/brewed."    # Raw commodities not baked/roasted/fermented (except coffee/cocoa)    if is_raw and rel_l in {"baked_by","roasted_by","brewed_by","fermented_by","confected_by","aged_by"}:        if not any(k in txt for k in ["coffee", "cocoa", "cacao"]):            return False, f"Raw commodities generally aren't '{rel}' directly."    return True, ""# ------------- LLM triple validation (batch) -------------def _format_triple(item: str, rel: str, org: str, stage: str) -> str:    return f"({item}) -[{rel.replace('_', ' ')}]-> ({org})  [stage={stage}]"@retry(max_tries=3, base_delay=0.6)def llm_validate_triples(candidates: List[Tuple[str, str, str, str]]) -> Dict[int, Dict[str, Any]]:    """    Validate triples with an LLM in batches.    Input: list of (item, rel, org, stage)    Output: dict[idx] = {"ok": bool, "reason": "<text>"}    """    client = get_openai_client()    if not client:        return {i: {"ok": True, "reason": ""} for i, _ in enumerate(candidates)}    sys = (        "You are a strict food-supply-chain validator. "        "Given item–relation–organization triples, decide if each triple is plausible. "        "Consider the item's nature (pickled, coffee, spice, meat, seafood, beverage), the verb "        "(baked_by, roasted_by, brewed_by, fermented_by, processed_by, ground_by, pressed_by, aged_by), also add an additional col "        "For relation return confidence score as the fourth fileld "        "interpreted as likelihood the triple is correct in real supply chains. "        "Calibration guide: 0.95=very standard, 0.75=plausible, 0.5=uncertain, 0.25=unlikely, 0.05=wrong. "        "and whether the organization type (bakery, roastery, picklery/fermenter, winery, butcher, distributor, supermarket, restaurant) "        "normally performs that action consider what is normal example bread baked at bekary but pickle baked at bakery is not a rlation.\n"        "Rules of thumb should be maintained :\n"        "- Pickled products are not baked_by or roasted_by.\n"        "- Coffee is roasted_by/ground_by (not baked_by or fermented_by).\n"        "- Breweries brew; wineries/cideries ferment; bakeries bake; roasteries roast; pickleries/fermenters ferment/process.\n"        "- Distributors/wholesalers/supermarkets sell/purchase/transport; they do not roast/bake/brew/ferment.\n"        "- Raw commodities are not baked/roasted/fermented unless contextually appropriate (e.g., coffee/cocoa beans -> roasted).\n"        "Output ONLY JSON list: [{\"idx\": <int>, \"ok\": true|false, \"reason\": \"...\"}]"    )    out: Dict[int, Dict[str, Any]] = {}    for chunk in batched(list(enumerate(candidates)), 60):        payload = [            {                "idx": i,                "item": it,                "relation": rel,                "organization": org,                "stage": stage,                "triple_pretty": _format_triple(it, rel, org, stage),            }            for i, (it, rel, org, stage) in chunk        ]        user = "Validate these triples. Return ONLY JSON as described.\n" + json.dumps(payload, ensure_ascii=False)        resp = client.chat.completions.create(            model=OPENAI_VALIDATOR_MODEL,            temperature=0.0,            messages=[{"role":"system","content":sys}, {"role":"user","content":user}]        )        try:            arr = json_relaxed_load(resp.choices[0].message.content.strip())            if not isinstance(arr, list):                raise ValueError("validator returned non-list JSON")            for obj in arr:                i = int(obj.get("idx"))                ok = bool(obj.get("ok"))                reason = str(obj.get("reason", "")).strip()                out[i] = {"ok": ok, "reason": reason}        except Exception as e:            for i, _ in chunk:                out[i] = {"ok": True, "reason": f"validator parse error: {e}"}    return out# ------------- synthesis to fixed triples -------------def synthesize_triples(    items: List[str],    stages: Dict[str, str],    ethnic: Dict[str, str],    origin: Dict[str, str],    cert: Dict[str, str]) -> List[List[str]]:    allowed = set(FIXED_RELS)    triples: List[List[str]] = []    skipped: List[Tuple[str,str,str,str,str]] = []  # (item, stage, rel, org, reason)    # 1) Collect stage-chain candidates via template + heuristic gate    stage_candidates: List[Tuple[str,str,str,str]] = []  # (item, rel, org, stage)    for it in items:        stage = stages.get(it, get_stage_default(it))        for rel, org in TEMPLATE_BY_STAGE.get(stage, []):            if rel not in allowed:                raise ValueError(f"Template used non-allowed relation: {rel}")            ok, reason = is_relation_plausible(it, rel, org, stage)            if ok:                stage_candidates.append((it, rel, org, stage))            else:                skipped.append((it, stage, rel, org, f"heuristic: {reason}"))    # 2) LLM validate (optional)    if VALIDATE_WITH_LLM and stage_candidates:        verdicts = llm_validate_triples(stage_candidates)    else:        verdicts = {i: {"ok": True, "reason": ""} for i in range(len(stage_candidates))}    # 3) Emit stage-chain triples allowed by both gates    for i, (it, rel, org, stage) in enumerate(stage_candidates):        if verdicts.get(i, {}).get("ok", True):            triples.append([it, rel, org])        else:            reason = verdicts[i].get("reason", "")            skipped.append((it, stage, rel, org, f"llm: {reason}"))    # 4) Tags & certification    for it in items:        seg = (ethnic.get(it) or "").strip()        if seg:            triples.append([it, "is_EthnicElement_Of", seg])        src = (origin.get(it) or "").strip()        if src:            triples.append([it, "is_imported_From", src])        stage = stages.get(it, get_stage_default(it))        auth = (cert.get(it) or "").strip()        if auth:            if stage in ("raw_commodity", "processed_product"):                triples.append([it, "certified_by", auth])            elif stage == "prepared_dish" and auth.lower() == "local health department":                triples.append([it, "certified_by", auth])    if skipped:        logger.info("Skipped %d triples (heuristic/LLM).", len(skipped))        for (itm, stg, rel, org, why) in skipped[:50]:            logger.debug("SKIP  %s  stage=%s  rel=%s  org=%s  reason=%s", itm, stg, rel, org, why)        if len(skipped) > 50:            logger.debug("... and %d more", len(skipped) - 50)    return triples# ------------- CSV -------------CSV_HEADER = ["food_item", "relation", "org_or_value", "score"]def write_csv(triples: List[List[str]], path: str):    with open(path, "w", newline="", encoding="utf-8") as f:        w = csv.writer(f)        w.writerow(CSV_HEADER)        w.writerows(triples)# ------------- diagnostics -------------def diagnostics_report(    items: List[str],    stages: Dict[str, str],    ethnic: Dict[str, str],    origin: Dict[str, str],    cert: Dict[str, str],    triples: List[List[str]]) -> Dict[str, Any]:    rel_counts = Counter(t[1] for t in triples)    stage_counts = Counter(stages.values())    return {        "num_items": len(items),        "stage_counts": dict(stage_counts),        "relation_counts": dict(rel_counts),        "ethnic_segment_examples": {k: ethnic[k] for k in list(ethnic)[:8]},        "import_origin_examples": {k: origin[k] for k in list(origin)[:8]},        "cert_authority_examples": {k: cert[k] for k in list(cert)[:8]},    }# ------------- Prompt + Cypher generation -------------PROMPT_HEADER = """You are a Neo4j + Food System Ontology expert operating in a regulated, multi-ontology environment.───────────────────────────────────────────────────────────────🎯 GOAL───────────────────────────────────────────────────────────────Given a food item f, generate Cypher code that builds *only plausible and legally valid* relationships betweenthe food item and all relevant business entities in the Food System Ontology.Each emitted Cypher block must:1. Use MATCH to anchor existing ontology nodes (FSConcept hierarchy);2. Use MERGE for instance creation (FoodItem, FoodBusiness, Organization, Regulation, etc.);3. Guarantee idempotency, semantic correctness, and full ontology connectivity (each subclass chain must reach FoodSystem).───────────────────────────────────────────────────────────────📥 INPUT───────────────────────────────────────────────────────────────food_item_name: {food_item_name}region: {region}relationship_set:  [grown_by, processed_by, manufactured_by, packaged_by,   transported_by, supplied_by, stored_by, sold_by,   certified_by, is_menu_item_of]ontology_top_classes:  Root → FoodSystem →    {{ FoodProduction, FoodProcessing, FoodDistribution,      FoodConsumption, FoodWasteManagement, FoodGovernance,      FoodProductionInput, FoodChainInfrastructure }}optional_metadata:  - cold_chain_required: {cold_chain_required}  - processing_level: {processing_level}  - class: {item_class}  - ethnic_tags: {ethnic_tags}  - certification_required: {certification_required}  - retail_channels_allowed: {retail_allowed}  - retail_channels_blocked: {retail_blocked}  - legality_flags: {legality_flags}  - data_source: {data_source}  - created_by_model: {created_by_model}  - confidence_score: {confidence_score}  - timestamp: {timestamp}───────────────────────────────────────────────────────────────🧮 INFERENCE RULES───────────────────────────────────────────────────────────────1. **Ontology Anchoring**   MATCH all required FSConcept nodes:   FoodProduction, FoodProcessing, FoodDistribution,   FoodGovernance, Restaurant, GroceryStore, etc.   If a required FSConcept node is missing, MERGE it   with property `status:'inferred'`.2. **Relationship Applicability**   Apply these default filters:   • wildlife_restricted (region="US"): GroceryStore/RetailDistribution      Restaurant, StreetFood.   • processed_plant_food:  all processing + packaging;  cold_chain.   • staple: full production→retail chain.   • seafood:  cold_chain,  certification.   • prepared_food:  restaurants only.   • beverage: manufacturer + distributor + retail.   • produce: farm + wholesaler + grocery + restaurant.   Skip illegal or implausible edges with a comment:   `// OMITTED: <reason>`.3. **Ethnic Inference**   Derive ethnic business subtypes from `ethnic_tags`   or linguistic cues in `food_item_name`:   "samosa" → IndianRestaurant   "tacos" → MexicanRestaurant   "bamboo shoot" → ThaiRestaurant, ChineseRestaurant.4. **Regulatory Integration**   If certification_required or regional rule applies:   MERGE (f)-[:regulated_under]->(:Regulation {{name:'<applicable law>'}})   MERGE (f)-[:certified_by]->(:Organization {{name:'<cert body>'}})   Optionally tag each regulation node with `jurisdiction`, `citation`, and `regulation_status`.5. **External Ontology Mapping**   MERGE (f)-[:mapped_to]->(:ExternalConcept         {{source:'FoodOn', id:'{foodon_id}', match_confidence:{mapping_conf}}})   Add additional mappings to AGROVOC/NALT if available.6. **Sustainability / Waste Hooks**   Optionally:   (f)-[:produces_waste]->(:FoodWasteType {{name:'ProcessingResidue'}})   (f)-[:recycled_into]->(:UpcycledProduct {{name:'Compost'}})7. **Provenance Recording**   Every generated graph includes:   (f)-[:inferred_by]->(:Model         {{name:'{created_by_model}', prompt_version:'v6',          confidence:{confidence_score}, timestamp:'{timestamp}'}})8. **Node Property Discipline**   Each MERGE for business nodes should include:     name, role, region, supply_chain_stage, scale   Example:     MERGE (riceMill:FoodBusiness            {{name:'RiceMill', role:'Processor',             region:'{region}', supply_chain_stage:'processing', scale:'industrial'}})9. **Uniqueness Constraints**   (add once per database)   CREATE CONSTRAINT IF NOT EXISTS FOR (n:FoodItem) REQUIRE n.name IS UNIQUE;   CREATE CONSTRAINT IF NOT EXISTS FOR (n:FSConcept) REQUIRE n.name IS UNIQUE;10. **Lifecycle and Temporal Attributes**    Set timestamps on creation:    ON CREATE SET f.created_at=datetime().───────────────────────────────────────────────────────────────📤 OUTPUT REQUIREMENTS───────────────────────────────────────────────────────────────- Only executable Cypher code.- Use headers:  // --- FOOD PRODUCTION ---  // --- FOOD PROCESSING ---  etc.- Include explanatory comments for each relationship block.- Optionally append a JSON summary block at the end."""def build_prompt_for_item(    food_item_name: str,    region: str,    item_class: str,    processing_level: str,    ethnic_tags,    certification_required: bool,    cold_chain_required: bool,    foodon_id: str | None,    mapping_conf: float,    retail_allowed=None,    retail_blocked=None,    legality_flags=None,    data_source="FoodOn",    created_by_model="GPT-5",    confidence_score=0.72,    timestamp=None,):    ts = timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())    return PROMPT_HEADER.format(        food_item_name=food_item_name,        region=region,        cold_chain_required=str(cold_chain_required).lower(),        processing_level=processing_level,        item_class=item_class,        ethnic_tags=json.dumps(ethnic_tags or [], ensure_ascii=False),        certification_required=str(certification_required).lower(),        retail_allowed=json.dumps(retail_allowed or [], ensure_ascii=False),        retail_blocked=json.dumps(retail_blocked or [], ensure_ascii=False),        legality_flags=json.dumps(legality_flags or {}, ensure_ascii=False),        data_source=data_source,        created_by_model=created_by_model,        confidence_score=confidence_score,        timestamp=ts,        foodon_id=(foodon_id or ""),        mapping_conf=mapping_conf,    )@retry(max_tries=3, base_delay=0.8)def generate_cypher_for_item(food_item_name: str, meta: Dict[str, Any]) -> str:    client = get_openai_client()    if client is None:        return f"""// Fallback Cypher (LLM unavailable)MERGE (f:FoodItem {{name:{json.dumps(food_item_name)}}})ON CREATE SET f.created_at=datetime()WITH fMERGE (root:FSConcept {{name:'FoodSystem'}})MERGE (f)-[:part_of]->(root)// TODO: Expand with processing, distribution, and regulation nodes"""    prompt = build_prompt_for_item(food_item_name=food_item_name, **meta)    sys = "Generate ONLY executable Cypher per the prompt's Output Requirements. Do not include explanations outside comments."    resp = client.chat.completions.create(        model=OPENAI_MODEL,        temperature=0,        messages=[            {"role":"system","content":sys},            {"role":"user","content":prompt}        ]    )    return _strip_code_fences(resp.choices[0].message.content.strip())# ------------- metadata mappers for prompt -------------def map_stage_to_processing_level(stage: str) -> str:    if stage == "raw_commodity":        return "raw"    if stage == "prepared_dish":        return "tertiary"    return "secondary"def map_item_class(item: str, stage: str) -> str:    t = (item or "").lower()    if any(k in t for k in ["salmon","shrimp","fish","tuna","mackerel"]):        return "seafood"    if any(k in t for k in ["beef","pork","chicken","lamb","meat"]):        return "meat"    if stage == "prepared_dish":        return "prepared_food"    if any(k in t for k in ["juice","tea","coffee","soda","drink","beverage","milk"]):        return "beverage"    if any(k in t for k in ["apple","lettuce","spinach","tomato","mango","banana"]):        return "produce"    if any(k in t for k in ["rice","wheat","corn","grain","lentil","bean"]):        return "staple"    return "processed_plant_food"def ethnicity_tags_from_label(label: str) -> list[str]:    if not label or label == "General American Grocery":        return []    return [label.replace(" Grocery","")]def certification_required_from_class(c: str) -> bool:    return c in ("seafood","meat","prepared_food")# ------------- CLI -------------def parse_args():    p = argparse.ArgumentParser()    p.add_argument("--limit", type=int, default=ITEM_LIMIT)    p.add_argument("--output", default=OUTPUT_CSV)    p.add_argument("--items-file", help="Optional newline-delimited items file")    p.add_argument("--emit-cypher", action="store_true", help="Emit Cypher per item using the regulated prompt")    p.add_argument("--region", default=REGION)    p.add_argument("--cypher-dir", default=CYPHER_DIR)    return p.parse_args()# ------------- main -------------def main():    args = parse_args()    st = State()    # 1) Items    if args.items_file:        with open(args.items_file, "r", encoding="utf-8") as f:            st.items = [line.strip() for line in f if line.strip()]    else:        st.items = fetch_items_via_cypher(args.limit)    # sanitize & dedupe    st.items = list(dict.fromkeys(x.strip() for x in st.items if x and x.strip()))    if not st.items:        print("No items returned.")        return    print(f"Items: {len(st.items)} (sample: {st.items[:5]})")    # 2) Stage    if llm_available():        st.item_stage = classify_stage_via_llm(st.items)    else:        st.item_stage = heuristic_stage(st.items)    # 3) Ethnic market segment    if llm_available():        st.ethnic_market = infer_ethnic_market_via_llm(st.items)    else:        st.ethnic_market = {it: heuristic_ethnic(it) for it in st.items}    # 4) Import origin    if llm_available():        st.import_origin = infer_import_origin_via_llm(st.items)    else:        st.import_origin = {it: heuristic_origin(it) for it in st.items}    # 5) U.S. certification authority    if llm_available():        st.us_cert_authority = infer_us_cert_authority_via_llm(st.items, st.item_stage)    else:        st.us_cert_authority = {it: heuristic_us_cert(it, st.item_stage.get(it, "processed_product")) for it in st.items}    # 6) Synthesize triples (strict fixed relations) with validation    st.triples = synthesize_triples(        st.items, st.item_stage, st.ethnic_market, st.import_origin, st.us_cert_authority    )    # 7) Write CSV    write_csv(st.triples, args.output)    # 8) Diagnostics    st.diagnostics = diagnostics_report(        st.items, st.item_stage, st.ethnic_market, st.import_origin, st.us_cert_authority, st.triples    )    print(f"✅ Wrote {len(st.triples)} triples to {args.output}")    print("Stages:", st.diagnostics["stage_counts"], " Relations:", st.diagnostics["relation_counts"])    print(json.dumps(st.diagnostics, indent=2))    # 9) Optional: Cypher emission (regulated prompt)    if args.emit_cypher or EMIT_CYPHER:        outdir = Path(args.cypher_dir)        outdir.mkdir(parents=True, exist_ok=True)        print(f"🔧 Emitting Cypher to: {outdir.resolve()} (region={args.region})")        for it in st.items:            stage = st.item_stage.get(it, "processed_product")            item_class = map_item_class(it, stage)            processing_level = map_stage_to_processing_level(stage)            tags = ethnicity_tags_from_label(st.ethnic_market.get(it, ""))            cert_req = certification_required_from_class(item_class)            cold_chain = item_class in ("seafood","prepared_food")            meta = dict(                region=args.region,                item_class=item_class,                processing_level=processing_level,                ethnic_tags=tags,                certification_required=cert_req,                cold_chain_required=cold_chain,                retail_allowed=[],                retail_blocked=[],                legality_flags={"region": args.region},                data_source="FoodOn",                created_by_model="GPT-5",                confidence_score=0.98,                timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),                foodon_id=None,                mapping_conf=0.85,            )            cypher = generate_cypher_for_item(it, meta)            fname = outdir / (re.sub(r"[^\w.-]+", "_", it) + ".cypher")            with open(fname, "w", encoding="utf-8") as f:                f.write(cypher + "\n")        print("✅ Cypher emission complete.")if __name__ == "__main__":    main()
