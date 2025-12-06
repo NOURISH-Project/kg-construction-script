@@ -1,34 +1,84 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+Direct FOODON → NAICS 2022 matching using OpenAI only.
+
+Options:
+- If you pass --item "basmati rice", it will match that single item.
+- Otherwise it pulls FOODON items from Neo4j with your Cypher:
+
+    MATCH (n)
+    WHERE toUpper(n.name) CONTAINS 'FOODON'
+      AND n.out_degree = 1
+    RETURN n.name_text AS item
+    LIMIT $limit
+
+Output CSV columns:
+  foodon_name, naics_name, naics_code, matching_probability, confidence_score
+"""
+
 import os
 import csv
-import argparse
-import unicodedata
 import re
-from dataclasses import dataclass
-from typing import List, Tuple
-from difflib import SequenceMatcher
+import json
+import time
+import argparse
+from functools import wraps
+from typing import List, Dict, Any, Tuple
 
+from dotenv import load_dotenv
 from neo4j import GraphDatabase
+from openai import OpenAI
 
-# ------------- Neo4j config (reuse your env vars) -------------
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+
+load_dotenv()
+# ------------ ENV ------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+NEO4J_URI      = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER     = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
+if not OPENAI_API_KEY:
+    raise RuntimeError("Set OPENAI_API_KEY in OPENAI_API_KEY env var")
 
-# ------------- Neo4j: fetch FOODON items -------------
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ------------ Helpers ------------
+
+def retry(max_tries=3, base_delay=0.5):
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_tries):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    if attempt + 1 == max_tries:
+                        raise
+                    delay = base_delay * (2 ** attempt)
+                    print(f"⚠️ Retry {fn.__name__} in {delay:.2f}s due to: {e}")
+                    time.sleep(delay)
+        return wrapper
+    return deco
+
+def json_relaxed_load(s: str):
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.DOTALL | re.IGNORECASE)
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"(\[.*\]|\{.*\})", s, flags=re.DOTALL)
+        if m:
+            return json.loads(m.group(1))
+        raise
+
+# ------------ Neo4j: fetch FOODON items ------------
+
 def fetch_foodon_items(limit: int) -> List[str]:
-    """
-    Uses your query:
-
-        MATCH (n)
-        WHERE toUpper(n.name) CONTAINS 'FOODON'
-          AND n.out_degree = 1
-        RETURN n.name_text AS item
-        LIMIT $limit
-    """
     q = """
         MATCH (n)
         WHERE toUpper(n.name) CONTAINS 'FOODON'
@@ -36,7 +86,6 @@ def fetch_foodon_items(limit: int) -> List[str]:
         RETURN n.name_text AS item
         LIMIT $limit
     """
-
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     try:
         with driver.session() as s:
@@ -45,168 +94,122 @@ def fetch_foodon_items(limit: int) -> List[str]:
     finally:
         driver.close()
 
-    # sanitize & dedupe
+    # sanitize + dedupe
     items = list(dict.fromkeys(x.strip() for x in items if x and x.strip()))
     return items
 
+# ------------ OpenAI: NAICS matching for ONE item ------------
 
-# ------------- NAICS model + loader -------------
-@dataclass
-class NaicsEntry:
-    code: str
-    title: str
-    norm_title: str
-    tokens: set
+@retry(max_tries=3, base_delay=0.7)
+def llm_match_naics_for_item(food_item: str) -> List[Dict[str, Any]]:
+    """
+    Ask OpenAI (NAICS 2022 knowledge) to return best NAICS categories
+    for a single food item.
 
-
-def _strip_diacritics(s: str) -> str:
-    return "".join(
-        c for c in unicodedata.normalize("NFKD", s)
-        if not unicodedata.combining(c)
+    Returns a list of objects:
+      {
+        "naics_code": "311212",
+        "naics_title": "Rice Milling",
+        "matching_probability": 0.9,
+        "confidence_score": 0.85
+      }
+    """
+    system_msg = (
+        "You are an expert in the NAICS 2022 industrial classification system. "
+        "Given a food item name, determine which NAICS 2022 codes best describe "
+        "the primary industry that PRODUCES or SELLS this item. "
+        "Base your answer on the official NAICS 2022 structure (codes and titles). "
+        "Return between 0 and 5 candidate codes.\n\n"
+        "For each candidate, output an object with:\n"
+        "  naics_code (string, e.g., '311212'),\n"
+        "  naics_title (official NAICS title),\n"
+        "  matching_probability (float in [0,1]),\n"
+        "  confidence_score (float in [0,1]).\n\n"
+        "matching_probability = how likely this NAICS code is correct.\n"
+        "confidence_score = how confident you are in that probability "
+        "given possible ambiguity.\n\n"
+        "Return ONLY a JSON array. Example format:\n"
+        "[{\"naics_code\":\"311212\",\"naics_title\":\"Rice Milling\","
+        "\"matching_probability\":0.9,\"confidence_score\":0.85}]"
     )
 
+    user_msg = f"Food item: {food_item}\n\nReturn JSON array as specified."
 
-def _normalize(text: str) -> str:
-    text = _strip_diacritics((text or "").lower())
-    # remove most punctuation
-    text = re.sub(r"[^a-z0-9\s]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+    )
 
+    content = resp.choices[0].message.content.strip()
+    data = json_relaxed_load(content)
+    if not isinstance(data, list):
+        raise ValueError("NAICS matcher returned non-list JSON")
+    return data
 
-def _tokenize(text: str) -> set:
-    return {t for t in _normalize(text).split() if t}
+# ------------ Bulk matching ------------
 
-
-def load_naics(csv_path: str) -> List[NaicsEntry]:
-    """
-    Expect CSV columns:
-        naics_code, naics_title
-
-    Adjust fieldnames here if your file is different.
-    """
-    entries: List[NaicsEntry] = []
-    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        # Allow some flexibility in column naming
-        # Try common variants
-        code_field = None
-        title_field = None
-        lower_fields = {name.lower(): name for name in reader.fieldnames}
-
-        for cand in ["naics_code", "code"]:
-            if cand in lower_fields:
-                code_field = lower_fields[cand]
-                break
-
-        for cand in ["naics_title", "title", "naics_title_2022"]:
-            if cand in lower_fields:
-                title_field = lower_fields[cand]
-                break
-
-        if not code_field or not title_field:
-            raise ValueError(
-                f"Could not find NAICS code/title columns in {csv_path}. "
-                f"Found columns: {reader.fieldnames}"
-            )
-
-        for row in reader:
-            code = (row.get(code_field) or "").strip()
-            title = (row.get(title_field) or "").strip()
-            if not code or not title:
-                continue
-            norm_title = _normalize(title)
-            tokens = _tokenize(title)
-            entries.append(NaicsEntry(code=code, title=title,
-                                      norm_title=norm_title, tokens=tokens))
-    return entries
-
-
-# ------------- Matching heuristic -------------
-def _jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    inter = len(a & b)
-    union = len(a | b)
-    return inter / union if union else 0.0
-
-
-def _string_ratio(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b).ratio()
-
-
-def match_probability(foodon_name: str, naics: NaicsEntry) -> float:
-    """
-    Compute a similarity-based 'probability' in [0,1].
-
-    Combination of:
-      - token Jaccard similarity
-      - character-level ratio
-    """
-    norm_foodon = _normalize(foodon_name)
-    tokens_foodon = _tokenize(foodon_name)
-
-    jacc = _jaccard(tokens_foodon, naics.tokens)
-    ratio = _string_ratio(norm_foodon, naics.norm_title)
-
-    # Simple weighted combination; you can tune these weights.
-    prob = 0.6 * jacc + 0.4 * ratio
-
-    # Cap within [0,1]
-    if prob < 0:
-        prob = 0.0
-    elif prob > 1:
-        prob = 1.0
-    return prob
-
-
-# ------------- Main matching logic -------------
-def match_foodon_to_naics(
-    foodon_items: List[str],
-    naics_entries: List[NaicsEntry],
-    min_score: float = 0.45
+def match_items_to_naics(
+    items: List[str],
+    min_prob: float = 0.4
 ) -> List[Tuple[str, str, str, float, float]]:
     """
-    Returns list of tuples:
-        (foodon_name, naics_title, naics_code, match_prob, confidence_score)
+    For each item, call OpenAI to get NAICS candidates,
+    filter by matching_probability >= min_prob.
 
-    - multiple NAICS per foodon are allowed
-    - matches with prob < min_score are dropped
+    Returns rows:
+      (foodon_name, naics_title, naics_code, matching_probability, confidence_score)
     """
-    results = []
+    results: List[Tuple[str, str, str, float, float]] = []
 
-    for food in foodon_items:
-        best_for_food = []
+    for idx, item in enumerate(items, start=1):
+        print(f"[{idx}/{len(items)}] Matching NAICS for: {item!r}")
+        try:
+            matches = llm_match_naics_for_item(item)
+        except Exception as e:
+            print(f"  ⚠️ Error for {item!r}: {e}")
+            continue
 
-        for naics in naics_entries:
-            prob = match_probability(food, naics)
-            if prob >= min_score:
-                # For now, use same value for probability & confidence.
-                confidence = prob
-                best_for_food.append((naics, prob, confidence))
+        if not matches:
+            print("  → No NAICS matches returned.")
+            continue
 
-        # Sort matches for this item by probability, descending
-        best_for_food.sort(key=lambda x: x[1], reverse=True)
+        for m in matches:
+            code = str(m.get("naics_code", "")).strip()
+            title = str(m.get("naics_title", "")).strip()
+            if not code or not title:
+                continue
+            try:
+                prob = float(m.get("matching_probability", 0.0))
+            except Exception:
+                prob = 0.0
+            try:
+                conf = float(m.get("confidence_score", prob))
+            except Exception:
+                conf = prob
 
-        for naics, prob, conf in best_for_food:
+            # clamp
+            prob = max(0.0, min(1.0, prob))
+            conf = max(0.0, min(1.0, conf))
+
+            if prob < min_prob:
+                continue
+
             results.append(
-                (food, naics.title, naics.code, round(prob, 4), round(conf, 4))
+                (item, title, code, round(prob, 4), round(conf, 4))
             )
 
     return results
 
+# ------------ CSV output ------------
 
-# ------------- CSV output -------------
-def write_matches_to_csv(
-    matches: List[Tuple[str, str, str, float, float]],
-    output_path: str
+def write_csv(
+    rows: List[Tuple[str, str, str, float, float]],
+    path: str
 ):
-    """
-    Columns:
-      foodon_name, naics_name, naics_code, matching_probability, confidence_score
-    """
     header = [
         "foodon_name",
         "naics_name",
@@ -214,65 +217,57 @@ def write_matches_to_csv(
         "matching_probability",
         "confidence_score",
     ]
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
+    with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(header)
-        for row in matches:
-            w.writerow(row)
+        w.writerows(rows)
 
+# ------------ CLI ------------
 
-# ------------- CLI -------------
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Match FOODON items in Neo4j to NAICS codes via string similarity."
+        description="Match FOODON names to NAICS 2022 codes using OpenAI (no NAICS CSV)."
+    )
+    p.add_argument(
+        "--item",
+        help="Single food item name to match (skips Neo4j).",
     )
     p.add_argument(
         "--limit",
         type=int,
-        default=200,
-        help="Max number of FOODON items to pull from Neo4j (default: 200).",
+        default=100,
+        help="If no --item given, max FOODON items to fetch from Neo4j (default: 100).",
     )
     p.add_argument(
-        "--naics-csv",
-        required=True,
-        help="Path to NAICS 2022 CSV with code/title columns.",
-    )
-    p.add_argument(
-        "--min-score",
+        "--min-prob",
         type=float,
-        default=0.45,
-        help="Minimum matching probability threshold (default: 0.45).",
+        default=0.4,
+        help="Minimum matching_probability to keep a match (default: 0.4).",
     )
     p.add_argument(
         "--output",
-        default="foodon_naics_matches.csv",
-        help="Output CSV path (default: foodon_naics_matches.csv).",
+        default="foodon_naics_llm_direct.csv",
+        help="Output CSV file (default: foodon_naics_llm_direct.csv).",
     )
     return p.parse_args()
-
 
 def main():
     args = parse_args()
 
-    # 1) Get FOODON items from Neo4j
-    food_items = fetch_foodon_items(args.limit)
-    if not food_items:
-        print("No FOODON items returned from Neo4j.")
-        return
-    print(f"Got {len(food_items)} FOODON items (sample: {food_items[:5]})")
+    if args.item:
+        items = [args.item.strip()]
+    else:
+        items = fetch_foodon_items(args.limit)
+        if not items:
+            print("No FOODON items found in Neo4j.")
+            return
+        print(f"Fetched {len(items)} FOODON items (sample: {items[:5]})")
 
-    # 2) Load NAICS
-    naics_entries = load_naics(args.naics_csv)
-    print(f"Loaded {len(naics_entries)} NAICS entries from {args.naics_csv}")
+    matches = match_items_to_naics(items, min_prob=args.min_prob)
+    print(f"Total kept matches (prob >= {args.min_prob}): {len(matches)}")
 
-    # 3) Match
-    matches = match_foodon_to_naics(food_items, naics_entries, min_score=args.min_score)
-    print(f"Found {len(matches)} FOODON–NAICS matches with score >= {args.min_score}")
-
-    # 4) Write CSV
-    write_matches_to_csv(matches, args.output)
+    write_csv(matches, args.output)
     print(f"✅ Wrote matches to {args.output}")
-
 
 if __name__ == "__main__":
     main()
