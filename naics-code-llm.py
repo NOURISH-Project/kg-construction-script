@@ -304,7 +304,7 @@ def llm_match_naics_for_item(food_item: str) -> List[Dict[str, Any]]:
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        temperature=0.0,
+        temperature=0.8,
         messages=[
             {"role": "system", "content": system_msg},
             {"role": "user",    "content": user_msg},
